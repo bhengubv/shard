@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shard-kv"
+version = "0.1.0"
+description = "KV cache compression for LLM inference"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.0"]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.40", "accelerate"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
