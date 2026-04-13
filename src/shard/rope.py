@@ -1,4 +1,5 @@
-"""RoPE utilities."""
+"""RoPE utilities and DP bit allocation."""
+import numpy as np
 import torch
 
 
@@ -45,3 +46,41 @@ def get_rope_inv_freq(model):
     if isinstance(rp, dict) and "rope_theta" in rp:
         theta = rp["rope_theta"]
     return 1.0 / (theta ** (torch.arange(0, hd, 2, dtype=torch.float32) / hd))
+
+
+def dp_bit_allocation(variances, total_budget):
+    """DP over groups of 64 components, allocating 0/2/4/6/8 bits each.
+    0-bit is penalized 4x over its MSE to discourage dropping directions."""
+    GROUP, OPTIONS, DROP, UNIT = 64, [0, 2, 4, 6, 8], 4.0, 16
+    v = variances.float().cpu()
+    d = v.shape[0]
+    ng = (d + GROUP - 1) // GROUP
+    gs = [min(GROUP, d - g * GROUP) for g in range(ng)]
+    gv = [v[g * GROUP: g * GROUP + gs[g]].sum().item() for g in range(ng)]
+
+    mu = total_budget // UNIT + 1
+    INF = float("inf")
+    dp = [[INF] * (mu + 1) for _ in range(ng + 1)]
+    back = [[0] * (mu + 1) for _ in range(ng + 1)]
+    dp[0] = [0.0] * (mu + 1)
+    for g in range(ng):
+        for b in range(mu + 1):
+            for bits in OPTIONS:
+                cost = 0 if bits == 0 else (gs[g] * bits + UNIT - 1) // UNIT
+                err = gv[g] * DROP if bits == 0 else gv[g] / (3.0 * (1 << (2 * bits)))
+                if b - cost < 0: continue
+                c = dp[g][b - cost] + err
+                if c < dp[g + 1][b]:
+                    dp[g + 1][b] = c
+                    back[g + 1][b] = bits
+
+    best = min(range(mu + 1), key=lambda b: dp[ng][b])
+    alloc = [0] * d
+    b = best
+    for g in range(ng - 1, -1, -1):
+        bits = back[g + 1][b]
+        for i in range(g * GROUP, g * GROUP + gs[g]):
+            alloc[i] = bits
+        if bits > 0:
+            b -= (gs[g] * bits + UNIT - 1) // UNIT
+    return alloc
