@@ -1,4 +1,5 @@
-"""RoPE utilities and DP bit allocation."""
+"""RoPE utilities, DP bit allocation, variable-bit quantization."""
+import zlib
 import numpy as np
 import torch
 
@@ -84,3 +85,82 @@ def dp_bit_allocation(variances, total_budget):
         if bits > 0:
             b -= (gs[g] * bits + UNIT - 1) // UNIT
     return alloc
+
+
+def _groups(alloc):
+    g, i = [], 0
+    while i < len(alloc):
+        bits, gs = alloc[i], 1
+        while i + gs < len(alloc) and alloc[i + gs] == bits and gs < 1024:
+            gs += 1
+        g.append((i, gs, bits)); i += gs
+    return g
+
+
+def quantize_group(projected, alloc):
+    n = projected.shape[0]
+    groups = _groups(alloc)
+    headers, payload = [], []
+    for start, gs, bits in groups:
+        if bits == 0: continue
+        block = projected[:, start:start + gs]
+        lo = block.min(dim=0).values
+        rng = (block.max(dim=0).values - lo).clamp(min=1e-6)
+        headers.append(np.stack([lo.cpu().numpy().astype(np.float32),
+                                  rng.cpu().numpy().astype(np.float32)], axis=1).tobytes())
+        levels = (1 << bits) - 1
+        arr = (((block - lo) / rng).clamp(0, 1) * levels).round().long().clamp(0, levels).byte().cpu().numpy()
+        if bits == 2:
+            if n % 4: arr = np.pad(arr, ((0, (4 - n % 4) % 4), (0, 0)))
+            for i in range(gs):
+                c = arr[:, i]
+                payload.append(((c[0::4] | (c[1::4] << 2) | (c[2::4] << 4) | (c[3::4] << 6)).astype(np.uint8).tobytes()))
+        elif bits == 4:
+            if n % 2: arr = np.pad(arr, ((0, 1), (0, 0)))
+            for i in range(gs):
+                c = arr[:, i]
+                payload.append((((c[0::2] & 0x0F) | ((c[1::2] & 0x0F) << 4)).astype(np.uint8).tobytes()))
+        else:
+            for i in range(gs):
+                payload.append(arr[:, i].tobytes())
+    nz = [(s, g, b) for s, g, b in groups if b > 0]
+    meta = np.array([len(nz), n], dtype=np.int32).tobytes()
+    g_bytes = b"".join(np.array([s, g, b], dtype=np.int16).tobytes() for s, g, b in nz)
+    return zlib.compress(meta + g_bytes + b"".join(headers) + b"".join(payload), level=6)
+
+
+def dequantize_group(compressed, alloc, n, device):
+    raw = zlib.decompress(compressed)
+    recon = torch.zeros(n, len(alloc), device=device)
+    ng = int(np.frombuffer(raw[:4], dtype=np.int32)[0])
+    off = 8
+    groups = []
+    for _ in range(ng):
+        s, g, b = np.frombuffer(raw[off:off + 6], dtype=np.int16)
+        groups.append((int(s), int(g), int(b))); off += 6
+    nz = sum(g for _, g, _ in groups)
+    hdr = np.frombuffer(raw[off:off + nz * 8], dtype=np.float32).reshape(-1, 2)
+    shifts = torch.from_numpy(hdr[:, 0].copy()).to(device)
+    scales = torch.from_numpy(hdr[:, 1].copy()).to(device)
+    p = off + nz * 8
+    ci = 0
+    for start, gs, bits in groups:
+        levels = (1 << bits) - 1
+        cols = []
+        for _ in range(gs):
+            if bits == 2:
+                nb = (n + 3) // 4
+                pk = np.frombuffer(raw[p:p + nb], dtype=np.uint8); p += nb
+                cols.append(np.stack([pk & 3, (pk >> 2) & 3, (pk >> 4) & 3, (pk >> 6) & 3], axis=1).ravel()[:n])
+            elif bits == 4:
+                nb = (n + 1) // 2
+                pk = np.frombuffer(raw[p:p + nb], dtype=np.uint8); p += nb
+                cols.append(np.stack([pk & 0x0F, (pk >> 4) & 0x0F], axis=1).ravel()[:n])
+            else:
+                cols.append(np.frombuffer(raw[p:p + n], dtype=np.uint8).copy()); p += n
+        arr = torch.from_numpy(np.stack(cols, axis=1)).to(device).float()
+        s = scales[ci:ci + gs].unsqueeze(0)
+        sh = shifts[ci:ci + gs].unsqueeze(0)
+        recon[:, start:start + gs] = arr / levels * s + sh
+        ci += gs
+    return recon
