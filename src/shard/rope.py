@@ -1,7 +1,9 @@
-"""RoPE utilities, DP bit allocation, variable-bit quantization."""
+"""RoPE utilities, DP bit allocation, variable-bit quantization, bit packing."""
+import math
 import zlib
 import numpy as np
 import torch
+from torch import Tensor
 
 
 def rotate_half(x):
@@ -164,3 +166,62 @@ def dequantize_group(compressed, alloc, n, device):
         recon[:, start:start + gs] = arr / levels * s + sh
         ci += gs
     return recon
+
+
+def pack_nbits(data, bits):
+    if bits == 8:
+        return data.byte().reshape(-1), data.reshape(-1).shape[0]
+    flat = data.reshape(-1).long()
+    n = flat.shape[0]
+    if bits == 4:
+        if n % 2: flat = torch.nn.functional.pad(flat, (0, 1))
+        return (flat[0::2] | (flat[1::2] << 4)).byte(), n
+    if bits == 2:
+        pad = (4 - n % 4) % 4
+        if pad: flat = torch.nn.functional.pad(flat, (0, pad))
+        return (flat[0::4] | (flat[1::4] << 2) | (flat[2::4] << 4) | (flat[3::4] << 6)).byte(), n
+    if bits == 1:
+        pad = (8 - n % 8) % 8
+        if pad: flat = torch.nn.functional.pad(flat, (0, pad))
+        out = torch.zeros(flat.shape[0] // 8, dtype=torch.uint8, device=data.device)
+        for i in range(8): out |= flat[i::8].byte() << i
+        return out, n
+    mask = (1 << bits) - 1
+    nb = (n * bits + 7) // 8
+    buf = torch.zeros(nb + 1, dtype=torch.int32, device=data.device)
+    pos = torch.arange(n, device=data.device) * bits
+    bi = pos >> 3; off = (pos & 7).int()
+    vals = (flat & mask).int()
+    buf.scatter_add_(0, bi, vals << off)
+    ov = (off + bits) > 8
+    if ov.any():
+        buf.scatter_add_(0, bi[ov] + 1, vals[ov] >> (8 - off[ov]))
+    return buf[:nb].byte(), n
+
+
+def unpack_nbits(packed, bits, n):
+    if bits == 8:
+        return packed[:n].byte()
+    if bits == 4:
+        return torch.stack([packed & 0x0F, (packed >> 4) & 0x0F], dim=-1).reshape(-1)[:n].byte()
+    if bits == 2:
+        return torch.stack([packed & 3, (packed >> 2) & 3, (packed >> 4) & 3, (packed >> 6) & 3],
+                            dim=-1).reshape(-1)[:n].byte()
+    if bits == 1:
+        out = torch.zeros(packed.shape[0] * 8, dtype=torch.uint8, device=packed.device)
+        for i in range(8): out[i::8] = (packed >> i) & 1
+        return out[:n]
+    mask = (1 << bits) - 1
+    pos = torch.arange(n, device=packed.device) * bits
+    bi = pos >> 3; off = pos & 7
+    p = packed.long()
+    vals = (p[bi] >> off) & mask
+    ov = (off + bits) > 8
+    if ov.any():
+        oi = bi[ov] + 1
+        valid = oi < packed.shape[0]
+        if valid.any():
+            hi = torch.zeros_like(oi)
+            hi[valid] = p[oi[valid]]
+            vals[ov] |= (hi << (8 - off[ov])) & mask
+    return vals.byte()
