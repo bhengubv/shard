@@ -7,17 +7,7 @@ makes inner-product estimation unbiased.
 import math
 import torch
 
-
-def _hadamard(x):
-    d = x.shape[-1]
-    h = 1
-    while h < d:
-        x = x.unflatten(-1, (-1, h * 2))
-        a, b = x[..., :h], x[..., h:]
-        x = torch.cat([a + b, a - b], dim=-1).flatten(-2)
-        h *= 2
-    return x / math.sqrt(d)
-
+from .cache import hadamard
 
 # Acklam's inverse normal CDF (for seeding Lloyd-Max)
 _A = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
@@ -28,7 +18,6 @@ _C = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
        -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
 _D = [7.784695709041462e-03, 3.224671290700398e-01,
        2.445134137142996e+00, 3.754408661907416e+00]
-
 
 def _inv_cdf(p):
     lo, hi = 0.02425, 1 - 0.02425
@@ -43,7 +32,6 @@ def _inv_cdf(p):
     q = math.sqrt(-2 * math.log(1 - p))
     return -(((((_C[0]*q+_C[1])*q+_C[2])*q+_C[3])*q+_C[4])*q+_C[5]) / \
             ((((_D[0]*q+_D[1])*q+_D[2])*q+_D[3])*q+1)
-
 
 def lloyd_max_codebook(d, bits, n_iter=100):
     n = 1 << bits
@@ -62,18 +50,16 @@ def lloyd_max_codebook(d, bits, n_iter=100):
         c = nc
     return torch.tensor(c, dtype=torch.float32)
 
-
 _codebooks = {}
 def get_codebook(d, bits, device):
     k = (d, bits)
     if k not in _codebooks: _codebooks[k] = lloyd_max_codebook(d, bits)
     return _codebooks[k].to(device)
 
-
 def quantize_per_token(kv, bits, signs, qjl=False):
     d = kv.shape[-1]
     codebook = get_codebook(d, bits, kv.device)
-    rotated = _hadamard(kv * signs)
+    rotated = hadamard(kv * signs)
     idx = torch.bucketize(rotated.contiguous(), codebook).clamp(max=codebook.shape[0] - 1)
     left = (idx - 1).clamp(min=0)
     idx = torch.where((codebook[left] - rotated).abs() < (codebook[idx] - rotated).abs(), left, idx)
@@ -84,10 +70,9 @@ def quantize_per_token(kv, bits, signs, qjl=False):
             torch.zeros_like(idx, dtype=torch.uint8),
             torch.zeros(kv.shape[:-1], device=kv.device, dtype=torch.float16))
 
-
 def dequantize_per_token(idx, bits, signs, qjl_signs=None, qjl_scale=None):
     codebook = get_codebook(idx.shape[-1], bits, idx.device)
     rotated = codebook[idx.long()]
     if qjl_signs is not None and qjl_scale is not None:
         rotated = rotated + (qjl_signs.float() * 2.0 - 1.0) * qjl_scale.unsqueeze(-1).float()
-    return (_hadamard(rotated) * signs).to(torch.float16)
+    return (hadamard(rotated) * signs).to(torch.float16)
