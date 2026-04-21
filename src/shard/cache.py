@@ -178,3 +178,92 @@ class CacheLayer(CacheLayerMixin):
             self._keys = self._keys.index_select(0, beam_idx.to(self._keys.device))
         if self._values is not None:
             self._values = self._values.index_select(0, beam_idx.to(self._values.device))
+
+
+class Cache(HFCache):
+    """KV cache compression. Prefill: per-layer online PCA on K + Hadamard+VQ on V."""
+    def __init__(self, head_dim=128, num_layers=32, n_kv_heads=8, device="cuda",
+                 k_target_cr=20.0, max_rank_k=192,
+                 v_vq_group_size=4, v_vq_codebook_size=256,
+                 sink_tokens=4, residual_window=64, rope_inv_freq=None):
+        self.head_dim = head_dim
+        self._num_layers = num_layers
+        self._n_kv_heads = n_kv_heads
+        self._per_layer_dim = n_kv_heads * head_dim
+        self._k_target_cr = k_target_cr
+        self._max_rank_k = max_rank_k
+        self._v_vq_group_size = v_vq_group_size
+        self._v_vq_codebook_size = v_vq_codebook_size
+        self._sink_tokens = sink_tokens
+        self._residual_window = residual_window
+        self._rope_inv_freq = rope_inv_freq
+        self._lazy_per_layer = True
+        self._last_accessed_layer = -1
+        self._compressed = False
+        self._compressed_layers = {}
+        super().__init__(layers=[CacheLayer(i) for i in range(num_layers)])
+        for l in self.layers:
+            l._cache_ref = self
+
+    @classmethod
+    def from_model(cls, model, k_target_cr=16.0, **kwargs):
+        cfg = model.config
+        hd = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+        return cls(head_dim=hd, num_layers=cfg.num_hidden_layers,
+                    n_kv_heads=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+                    device=str(next(model.parameters()).device),
+                    k_target_cr=k_target_cr,
+                    rope_inv_freq=get_rope_inv_freq(model), **kwargs)
+
+    def compress(self):
+        if self._compressed: return
+        k0 = self.layers[0].keys
+        if k0 is None: return
+        B, _, seq, _ = k0.shape
+        sink, win = self._sink_tokens, self._residual_window
+        if seq <= sink + win + 4: return
+
+        start, end = sink, seq - win
+        n_comp = end - start
+        positions = torch.arange(seq, device=k0.device)[start:end]
+
+        for li in range(self._num_layers):
+            torch.manual_seed(42 + li)
+            layer = self.layers[li]
+            k_full = layer.keys
+            k = self._compress_k(k_full[:, :, start:end, :], positions, B, n_comp)
+            self._compressed_layers[li] = {
+                **k,
+                "sink_k": k_full[:, :, :sink, :].clone(),
+                "win_k": k_full[:, :, end:, :].clone(),
+                "n_compress": n_comp, "batch": B, "compress_start": start,
+            }
+
+        self._compressed = True
+
+    def _compress_k(self, k_mid, positions, B, n_comp):
+        k = (undo_rope(k_mid.float(), positions, self._rope_inv_freq)
+             if self._rope_inv_freq is not None else k_mid.float())
+        flat = k.permute(0, 2, 1, 3).reshape(B * n_comp, self._per_layer_dim)
+        n, p = flat.shape
+        mean = flat.mean(dim=0)
+        rank = min(self._max_rank_k, p, n - 1)
+        _, S, V = torch.svd_lowrank(flat - mean, q=rank, niter=24)
+        basis = V[:, :rank]
+        eigvals = (S[:rank].float() ** 2) / n
+
+        budget = max(64, int(self._per_layer_dim * 16 / self._k_target_cr))
+        alloc = dp_bit_allocation(eigvals, budget)
+        keep = sum(1 for b in alloc if b > 0)
+        if keep > 0:
+            basis = basis[:, :keep].contiguous()
+            alloc = alloc[:keep]
+
+        col_max = basis.abs().max(dim=0).values.clamp(min=1e-6)
+        scale = col_max / 127.0
+        basis_q = (basis / scale).round().clamp(-127, 127).to(torch.int8)
+        proj = (flat - mean.float()) @ (basis_q.float() * scale.float())[:, :keep]
+        return {"k_basis_q": basis_q, "k_scale": scale.half(),
+                "k_mean": mean.half(), "k_alloc": alloc,
+                "k_bytes": quantize_group(proj, alloc),
+                "k_n_total": B * n_comp}
