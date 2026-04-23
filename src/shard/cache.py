@@ -179,9 +179,73 @@ class CacheLayer(CacheLayerMixin):
         if self._values is not None:
             self._values = self._values.index_select(0, beam_idx.to(self._values.device))
 
+    def _stream_append(self, k, v, position):
+        from .streaming import quantize_per_token
+        gc = self._gpu_compressed
+        c = self._cache_ref
+        bits, qjl = c._stream_bits, c._stream_qjl
+        _, heads, _, hd = k.shape
+        B = k.shape[0]
+
+        if "signs" not in gc:
+            g = torch.Generator(device="cpu").manual_seed(42 + self.layer_idx * 7919)
+            gc["signs"] = ((torch.randint(0, 2, (hd,), generator=g) * 2 - 1)
+                            .to(k.device, torch.float32))
+        signs = gc["signs"]
+
+        def _unit(t):
+            t = t.float().squeeze(2)
+            n = t.norm(dim=-1).clamp(min=1e-8)
+            return t / n.unsqueeze(-1), n
+
+        k_u, k_n = _unit(k)
+        v_u, v_n = _unit(v)
+        k_idx, k_qs, k_qsc = quantize_per_token(k_u, bits, signs, qjl=qjl)
+        v_idx, v_qs, v_qsc = quantize_per_token(v_u, bits, signs, qjl=qjl)
+
+        def _add(key, val):
+            gc[key] = val if key not in gc else torch.cat([gc[key], val])
+
+        _add("k_idx", k_idx.reshape(-1))
+        _add("v_idx", v_idx.reshape(-1))
+        _add("k_norm", k_n.reshape(-1).half())
+        _add("v_norm", v_n.reshape(-1).half())
+        if qjl:
+            _add("k_qsign", k_qs.reshape(-1))
+            _add("v_qsign", v_qs.reshape(-1))
+            _add("k_qscale", k_qsc.reshape(-1))
+            _add("v_qscale", v_qsc.reshape(-1))
+        gc["stream_n"] = gc.get("stream_n", 0) + B
+
+    def _dequant_stream(self, gc, B, nkv, hd):
+        n = gc.get("stream_n", 0)
+        if n == 0 or "k_idx" not in gc: return None, None
+        from .streaming import dequantize_per_token
+        c = self._cache_ref
+        bits, qjl = c._stream_bits, c._stream_qjl
+        signs = gc["signs"]
+        s = n // B
+
+        k_idx = gc["k_idx"].view(s, B, nkv, hd)
+        v_idx = gc["v_idx"].view(s, B, nkv, hd)
+        k_n = gc["k_norm"].view(s, B, nkv).float()
+        v_n = gc["v_norm"].view(s, B, nkv).float()
+        k_qs = v_qs = k_qsc = v_qsc = None
+        if qjl and "k_qsign" in gc:
+            k_qs = gc["k_qsign"].view(s, B, nkv, hd)
+            v_qs = gc["v_qsign"].view(s, B, nkv, hd)
+            k_qsc = gc["k_qscale"].view(s, B, nkv)
+            v_qsc = gc["v_qscale"].view(s, B, nkv)
+
+        k_u = dequantize_per_token(k_idx, bits, signs, k_qs, k_qsc).float()
+        v_u = dequantize_per_token(v_idx, bits, signs, v_qs, v_qsc).float()
+        sk = (k_u * k_n.unsqueeze(-1)).half().permute(1, 2, 0, 3).contiguous()
+        sv = (v_u * v_n.unsqueeze(-1)).half().permute(1, 2, 0, 3).contiguous()
+        return sk, sv
+
 
 class Cache(HFCache):
-    """KV cache compression. Prefill: per-layer online PCA on K + Hadamard+VQ on V."""
+    """KV cache compression with optional TurboQuant-style 8-bit decode streaming."""
     def __init__(self, head_dim=128, num_layers=32, n_kv_heads=8, device="cuda",
                  k_target_cr=20.0, max_rank_k=192,
                  v_vq_group_size=4, v_vq_codebook_size=256,
@@ -197,6 +261,9 @@ class Cache(HFCache):
         self._sink_tokens = sink_tokens
         self._residual_window = residual_window
         self._rope_inv_freq = rope_inv_freq
+        self._streaming = False
+        self._stream_bits = 8
+        self._stream_qjl = False
         self._lazy_per_layer = True
         self._last_accessed_layer = -1
         self._compressed = False
@@ -230,12 +297,15 @@ class Cache(HFCache):
         for li in range(self._num_layers):
             torch.manual_seed(42 + li)
             layer = self.layers[li]
-            k_full = layer.keys
+            k_full, v_full = layer.keys, layer.values
             k = self._compress_k(k_full[:, :, start:end, :], positions, B, n_comp)
+            v = self._compress_v(v_full[:, :, start:end, :], B)
             self._compressed_layers[li] = {
-                **k,
+                **k, **v,
                 "sink_k": k_full[:, :, :sink, :].clone(),
+                "sink_v": v_full[:, :, :sink, :].clone(),
                 "win_k": k_full[:, :, end:, :].clone(),
+                "win_v": v_full[:, :, end:, :].clone(),
                 "n_compress": n_comp, "batch": B, "compress_start": start,
             }
 
@@ -267,3 +337,10 @@ class Cache(HFCache):
                 "k_mean": mean.half(), "k_alloc": alloc,
                 "k_bytes": quantize_group(proj, alloc),
                 "k_n_total": B * n_comp}
+
+    def _compress_v(self, v_mid, B):
+        bh = B * self._n_kv_heads
+        flat = v_mid.float().reshape(bh, v_mid.shape[2], self.head_dim)
+        return {"v_qdata": vq_encode(hadamard(flat),
+                                       self._v_vq_group_size,
+                                       self._v_vq_codebook_size)}
