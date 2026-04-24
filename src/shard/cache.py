@@ -309,6 +309,7 @@ class Cache(HFCache):
                 "n_compress": n_comp, "batch": B, "compress_start": start,
             }
 
+        self._build_gpu_format()
         self._compressed = True
 
     def _compress_k(self, k_mid, positions, B, n_comp):
@@ -344,3 +345,85 @@ class Cache(HFCache):
         return {"v_qdata": vq_encode(hadamard(flat),
                                        self._v_vq_group_size,
                                        self._v_vq_codebook_size)}
+
+    def _build_gpu_format(self):
+        for li in range(self._num_layers):
+            data = self._compressed_layers.get(li)
+            if data is None: continue
+            dev = "cuda"
+            n_total = data["k_n_total"]
+            keep = len(data["k_alloc"])
+
+            coeffs = dequantize_group(data["k_bytes"], data["k_alloc"], n_total, dev)
+            col_max = coeffs.abs().amax(dim=0).clamp(min=1e-6)
+            coeff_scale = col_max / 7.0
+            q = (coeffs / coeff_scale).round().clamp(-7, 7)
+            shifted = (q + 8).to(torch.uint8)
+            flat = shifted.reshape(-1)
+            if flat.shape[0] % 2:
+                flat = torch.cat([flat, torch.zeros(1, dtype=torch.uint8, device=dev)])
+            k_coeffs = flat[0::2] | (flat[1::2] << 4)
+
+            layer = self.layers[li]
+            layer._gpu_compressed = {
+                "k_coeffs": k_coeffs,
+                "k_coeff_scale": coeff_scale.half().to(dev),
+                "k_coeffs_shape": (n_total, keep),
+                "k_basis_q": data["k_basis_q"][:, :keep].to(dev),
+                "k_basis_scale": data["k_scale"][:keep].to(dev),
+                "k_mean": data["k_mean"].to(dev),
+                "v_qdata": data["v_qdata"],
+                "v_packed": data["v_qdata"]["packed"].to(dev),
+                "sink_k": data["sink_k"].to(dev),
+                "sink_v": data["sink_v"].to(dev),
+                "win_k": data["win_k"].to(dev),
+                "win_v": data["win_v"].to(dev),
+                "n_compress": data["n_compress"],
+                "batch": data["batch"],
+                "compress_start": data["compress_start"],
+            }
+            layer._keys = None
+            layer._values = None
+            layer._needs_decompress = True
+
+        self._compressed_layers.clear()
+        torch.cuda.empty_cache()
+
+    def memory_bytes(self):
+        def nb(t): return t.nelement() * t.element_size()
+        total = 0
+        has_gc = False
+        for l in self.layers:
+            gc = getattr(l, "_gpu_compressed", None)
+            if gc is None: continue
+            has_gc = True
+            total += sum(nb(gc[k]) for k in
+                         ["k_coeffs", "k_coeff_scale", "k_basis_q",
+                          "k_basis_scale", "k_mean", "v_packed",
+                          "sink_k", "sink_v", "win_k", "win_v"])
+            total += nb(gc["v_qdata"]["ch_maxabs"])
+            if gc["v_qdata"].get("centroids") is not None:
+                total += nb(gc["v_qdata"]["centroids"])
+            if "k_idx" in gc:
+                bpv = self._stream_bits / 8.0
+                for k in ["k_idx", "v_idx"]: total += int(gc[k].nelement() * bpv)
+                for k in ["k_norm", "v_norm"]: total += nb(gc[k])
+            if "decode_k" in gc:
+                total += nb(gc["decode_k"]) + nb(gc["decode_v"])
+        if has_gc: return total
+        return sum(nb(l._keys) + nb(l._values) for l in self.layers if l._keys is not None)
+
+    def fp16_equivalent_bytes(self):
+        gc = getattr(self.layers[0], "_gpu_compressed", None)
+        if gc is not None:
+            seq = gc["n_compress"] + self._sink_tokens + self._residual_window + gc.get("stream_n", 0)
+        elif self._compressed_layers:
+            seq = next(iter(self._compressed_layers.values()))["n_compress"] + self._sink_tokens + self._residual_window
+        elif self.layers[0]._keys is not None:
+            seq = self.layers[0]._keys.shape[2]
+        else:
+            return 0
+        return seq * self._n_kv_heads * self.head_dim * 4 * self._num_layers
+
+    def compress_ratio(self):
+        return self.fp16_equivalent_bytes() / max(self.memory_bytes(), 1)
