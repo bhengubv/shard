@@ -50,3 +50,22 @@ def compressed_scores(q_rope, gc, pos_q, n_q, nkv, hd, inv_freq):
     sin_d = phase.sin().to(torch.float16)
     scores = torch.einsum("bhspc,cp->bhsc", U, cos_d) + torch.einsum("bhspc,cp->bhsc", V, sin_d)
     return scores / math.sqrt(hd)
+
+def _v_weighted_sum_compressed(weights_mid, gc, B, nkv, n_comp, hd):
+    """Fused V path: codebook lookup -> weighted sum -> inverse Hadamard at the end."""
+    from .cache import hadamard
+    from .rope import unpack_nbits
+
+    qd = gc["v_qdata"]
+    gs = qd["group_size"]
+    ng = hd // gs
+    idx = unpack_nbits(qd["packed"].to(weights_mid.device), qd["bits"], qd["n_orig"])
+    idx = idx[:B * nkv * n_comp * ng].view(B * nkv, n_comp, ng).long()
+    centroids = qd["centroids"].to(weights_mid.device).float()
+    ch_max = qd["ch_maxabs"].to(weights_mid.device).float()
+    gqa = weights_mid.shape[1] // nkv
+
+    v_rot = centroids[idx].view(B * nkv, n_comp, hd) * ch_max.unsqueeze(1)
+    v_rot = v_rot.view(B, nkv, n_comp, hd).repeat_interleave(gqa, dim=1)
+    out_rot = torch.einsum("bhsk,bhkd->bhsd", weights_mid, v_rot)
+    return hadamard(out_rot.to(torch.float16)).float()
