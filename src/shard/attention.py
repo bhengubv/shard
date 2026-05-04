@@ -40,9 +40,22 @@ def compressed_scores(q_rope, gc, pos_q, n_q, nkv, hd, inv_freq):
     A_mean = a * mc.unsqueeze(0).unsqueeze(2) + b * md.unsqueeze(0).unsqueeze(2)
     B_mean = b * mc.unsqueeze(0).unsqueeze(2) - a * md.unsqueeze(0).unsqueeze(2)
 
-    coefs = _unpack_int4(gc["k_coeffs"], n_total, rank).to(dev).view(B, n_comp, rank)
-    U = torch.einsum("bhspr,bcr->bhspc", A, coefs) + A_mean.unsqueeze(-1)
-    V = torch.einsum("bhspr,bcr->bhspc", Bm, coefs) + B_mean.unsqueeze(-1)
+    # Fast path (B=1, Triton available): skip int4 unpack, matmul-in-kernel
+    from .triton_kernels import int4_matmul, HAS_TRITON
+    if B == 1 and HAS_TRITON and q_rope.is_cuda:
+        half_rank = (rank + 1) // 2
+        b_packed = gc["k_coeffs"].view(n_comp, half_rank)
+        M = n_q * hd2
+        A_nos = (a.unsqueeze(-1) * bc_e + b.unsqueeze(-1) * bd_e)
+        Bm_nos = (b.unsqueeze(-1) * bc_e - a.unsqueeze(-1) * bd_e)
+        u_flat = int4_matmul(A_nos.view(M, rank), b_packed, coeff_scale, n_comp, rank)
+        v_flat = int4_matmul(Bm_nos.view(M, rank), b_packed, coeff_scale, n_comp, rank)
+        U = u_flat.view(1, n_q, 1, hd2, n_comp) + A_mean.unsqueeze(-1)
+        V = v_flat.view(1, n_q, 1, hd2, n_comp) + B_mean.unsqueeze(-1)
+    else:
+        coefs = _unpack_int4(gc["k_coeffs"], n_total, rank).to(dev).view(B, n_comp, rank)
+        U = torch.einsum("bhspr,bcr->bhspc", A, coefs) + A_mean.unsqueeze(-1)
+        V = torch.einsum("bhspr,bcr->bhspc", Bm, coefs) + B_mean.unsqueeze(-1)
 
     pos_t = torch.arange(gc["compress_start"], gc["compress_start"] + n_comp, device=dev)
     phase = (pos_t - pos_q).float().unsqueeze(-1) * inv_freq.to(dev).float()
