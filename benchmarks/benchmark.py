@@ -189,6 +189,68 @@ def run():
               f"Shard={cp_avg:5.2f}  Δ={cp_avg-fp_avg:+5.2f}  "
               f"cr={cr_avg:.1f}x", flush=True)
 
+    # WikiText-2 PPL
+    print(f"\n--- WIKITEXT-2 PPL ---")
+    wt2 = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    wt2_text = "\n".join([t for t in wt2["text"] if t.strip()])
+    wt2_ids = tok(wt2_text, return_tensors="pt").input_ids[0].to(device)
+
+    import torch.nn.functional as F
+    n_windows = min(10, (wt2_ids.shape[0] - 256) // 2048)
+    fp_ppl, cp_ppl = [], []
+    for wi in range(n_windows):
+        start = wi * 2048
+        ids = wt2_ids[start:start + 2304].unsqueeze(0)
+        if ids.shape[1] < 2304: continue
+        with torch.no_grad():
+            logits_fp = model(ids).logits
+        shift_fp = logits_fp[:, 2047:-1, :].contiguous()
+        labels = ids[:, 2048:]
+        loss_fp = F.cross_entropy(
+            shift_fp.reshape(-1, shift_fp.size(-1)),
+            labels.reshape(-1)).item()
+
+        cache = make_cache()
+        ctx = ids[:, :2048]
+        evl = ids[:, 2048:]
+        with torch.no_grad():
+            model(ctx, use_cache=True, past_key_values=cache)
+        cache.compress()
+        pos_ids = torch.arange(2048, 2304, device=device).unsqueeze(0)
+        with torch.no_grad():
+            out_c = model(evl, past_key_values=cache, use_cache=True,
+                           position_ids=pos_ids)
+        shift_c = out_c.logits[:, :-1, :].contiguous()
+        evl_labels = evl[:, 1:]
+        ml = min(shift_c.shape[1], evl_labels.shape[1])
+        loss_c = F.cross_entropy(
+            shift_c[:, :ml].reshape(-1, shift_c.size(-1)),
+            evl_labels[:, :ml].reshape(-1)).item()
+        fp_ppl.append(math.exp(loss_fp))
+        cp_ppl.append(math.exp(loss_c))
+        del cache; torch.cuda.empty_cache()
+
+    if fp_ppl:
+        fp_avg = sum(fp_ppl) / len(fp_ppl)
+        cp_avg = sum(cp_ppl) / len(cp_ppl)
+        print(f"  FP16 PPL: {fp_avg:.2f}", flush=True)
+        print(f"  Shard PPL: {cp_avg:.2f}  (Δ={100*(cp_avg-fp_avg)/fp_avg:+.2f}%)", flush=True)
+
+    # Compression by context length
+    print(f"\n--- COMPRESSION BY CONTEXT ---")
+    for sl in [4096, 8192, 16384, 32768]:
+        if hay_ids.shape[0] < sl: continue
+        ids = hay_ids[:sl].unsqueeze(0).to(device)
+        cache = make_cache()
+        with torch.no_grad():
+            model.generate(ids, max_new_tokens=2, do_sample=False,
+                           past_key_values=cache,
+                           pad_token_id=tok.eos_token_id)
+        cr = cache.compress_ratio()
+        mem = cache.memory_bytes() / 1024 / 1024
+        print(f"  seq={sl:>6}: {cr:.1f}x  stored={mem:.0f}MB", flush=True)
+        del cache; torch.cuda.empty_cache()
+
 
 @app.local_entrypoint()
 def main():
