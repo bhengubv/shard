@@ -51,11 +51,14 @@ def run():
     nkv = getattr(model.config, "num_key_value_heads",
                   model.config.num_attention_heads)
 
-    def make_cache():
-        return Cache(head_dim=hd, num_layers=nl, n_kv_heads=nkv,
-                     device=device, k_target_cr=20, max_rank_k=192,
-                     v_vq_group_size=4, v_vq_codebook_size=256,
-                     residual_window=64, rope_inv_freq=inv_freq)
+    def make_cache(streaming=False, stream_bits=8):
+        c = Cache(head_dim=hd, num_layers=nl, n_kv_heads=nkv,
+                  device=device, k_target_cr=20, max_rank_k=192,
+                  v_vq_group_size=4, v_vq_codebook_size=256,
+                  residual_window=64, rope_inv_freq=inv_freq)
+        c._streaming = streaming
+        c._stream_bits = stream_bits
+        return c
 
     # NIAH
     print(f"\n--- NIAH ---")
@@ -250,6 +253,35 @@ def run():
         mem = cache.memory_bytes() / 1024 / 1024
         print(f"  seq={sl:>6}: {cr:.1f}x  stored={mem:.0f}MB", flush=True)
         del cache; torch.cuda.empty_cache()
+
+    # Streaming quality (TurboQuant-style 8-bit lossless)
+    print(f"\n--- STREAMING QUALITY (8-bit lossless) ---")
+    prefix = hay_ids[:8000]
+    prompts = [
+        "\n\nQ: Capital of France?\nA:",
+        "\n\ndef reverse_string(s):",
+        "\n\nThe scientific method involves",
+        "\n\nOnce upon a time in a kingdom",
+        "\n\nSolve: 2x+5=13. x=",
+    ]
+    tm, tt = 0, 0
+    for p in prompts:
+        p_ids = tok(p, return_tensors="pt").input_ids[0]
+        full = torch.cat([prefix, p_ids]).unsqueeze(0).to(device)
+        with torch.no_grad():
+            out_fp = model.generate(full, max_new_tokens=150, do_sample=False,
+                                     pad_token_id=tok.eos_token_id)
+        fp = out_fp[0][full.shape[1]:].tolist()
+        cache = make_cache(streaming=True, stream_bits=8)
+        with torch.no_grad():
+            out_c = model.generate(full, max_new_tokens=150, do_sample=False,
+                                    past_key_values=cache,
+                                    pad_token_id=tok.eos_token_id)
+        cp = out_c[0][full.shape[1]:].tolist()
+        m = sum(1 for a, b in zip(fp, cp) if a == b)
+        tm += m; tt += min(len(fp), len(cp))
+        del cache; torch.cuda.empty_cache()
+    print(f"  Streaming 8-bit: {tm}/{tt} ({100*tm/tt:.1f}%)", flush=True)
 
 
 @app.local_entrypoint()
