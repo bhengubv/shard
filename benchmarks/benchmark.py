@@ -283,6 +283,47 @@ def run():
         del cache; torch.cuda.empty_cache()
     print(f"  Streaming 8-bit: {tm}/{tt} ({100*tm/tt:.1f}%)", flush=True)
 
+    # Decode throughput
+    print(f"\n--- DECODE THROUGHPUT (tok/s) ---")
+    import time
+    N_DECODE = 128
+    N_WARMUP = 8
+    for ctx_len in [2048, 4096, 8192]:
+        if hay_ids.shape[0] < ctx_len: continue
+        ids = hay_ids[:ctx_len].unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            model.generate(ids, max_new_tokens=N_WARMUP, do_sample=False,
+                           pad_token_id=tok.eos_token_id)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        with torch.no_grad():
+            model.generate(ids, max_new_tokens=N_DECODE, do_sample=False,
+                           pad_token_id=tok.eos_token_id)
+        torch.cuda.synchronize()
+        fp_tps = N_DECODE / (time.time() - t0)
+
+        c_warm = make_cache()
+        with torch.no_grad():
+            model.generate(ids, max_new_tokens=N_WARMUP, do_sample=False,
+                           past_key_values=c_warm,
+                           pad_token_id=tok.eos_token_id)
+        del c_warm; torch.cuda.empty_cache()
+        cache = make_cache()
+        torch.cuda.synchronize()
+        t0 = time.time()
+        with torch.no_grad():
+            model.generate(ids, max_new_tokens=N_DECODE, do_sample=False,
+                           past_key_values=cache,
+                           pad_token_id=tok.eos_token_id)
+        torch.cuda.synchronize()
+        sh_tps = N_DECODE / (time.time() - t0)
+        cr = cache.compress_ratio()
+        del cache; torch.cuda.empty_cache()
+        print(f"  ctx={ctx_len:>5}: FP16={fp_tps:6.2f} tok/s  "
+              f"Shard={sh_tps:6.2f} tok/s  ({sh_tps/fp_tps:.2f}× FP16, cr={cr:.1f}×)",
+              flush=True)
+
 
 @app.local_entrypoint()
 def main():

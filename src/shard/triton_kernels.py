@@ -429,3 +429,174 @@ def _score_softmax_vq_torch(U, V, mean_c, mean_s, cos, sin, v_indices, v_codeboo
     v_rot = v_codebook[v_indices.long()].reshape(N, hd).float() * v_ch.float()
     out = p @ v_rot
     return out, m, l
+
+
+
+# ---------------------------------------------------------------------------
+# int4 pack: flat int8 [-7, 7] stream → uint8 nibbles
+# ---------------------------------------------------------------------------
+
+if HAS_TRITON:
+    @triton.jit
+    def _int4_pack_kernel(
+        In_ptr, Out_ptr,
+        N_half,
+        BN: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BN + tl.arange(0, BN)
+        mask = offs < N_half
+        lo = tl.load(In_ptr + offs * 2, mask=mask, other=0)
+        hi = tl.load(In_ptr + offs * 2 + 1, mask=mask, other=0)
+        lo_s = (lo + 8).to(tl.uint8) & 0x0F
+        hi_s = (hi + 8).to(tl.uint8) & 0x0F
+        tl.store(Out_ptr + offs, lo_s | (hi_s << 4), mask=mask)
+
+
+def int4_pack(x):
+    flat = x.reshape(-1).contiguous()
+    n = flat.shape[0]
+    if n & 1:
+        flat = torch.cat([flat, torch.zeros(1, dtype=flat.dtype, device=flat.device)])
+        n += 1
+    n_half = n // 2
+
+    if not (HAS_TRITON and x.is_cuda):
+        shifted = (flat + 8).to(torch.uint8) & 0x0F
+        return (shifted[0::2] | (shifted[1::2] << 4)).contiguous()
+
+    out = torch.empty(n_half, dtype=torch.uint8, device=flat.device)
+    BN = 1024
+    grid = (triton.cdiv(n_half, BN),)
+    _int4_pack_kernel[grid](flat, out, n_half, BN=BN)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# VQ assign: nearest-centroid argmin (kmeans inner loop)
+# ---------------------------------------------------------------------------
+
+if HAS_TRITON:
+    @triton.jit
+    def _vq_assign_kernel(
+        X_ptr, Cb_ptr, Out_ptr,
+        N, K, D: tl.constexpr,
+        sxn, sxd,
+        sck, scd,
+        BN: tl.constexpr, BK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_n = pid * BN + tl.arange(0, BN)
+        n_mask = offs_n < N
+        offs_k_base = tl.arange(0, BK)
+
+        best_dist = tl.full((BN,), float("inf"), tl.float32)
+        best_idx = tl.zeros((BN,), tl.int32)
+
+        for k_start in range(0, K, BK):
+            offs_k = k_start + offs_k_base
+            k_mask = offs_k < K
+            dist = tl.zeros((BN, BK), tl.float32)
+            for d in tl.static_range(D):
+                xd = tl.load(X_ptr + offs_n * sxn + d * sxd,
+                              mask=n_mask, other=0.0).to(tl.float32)
+                cd = tl.load(Cb_ptr + offs_k * sck + d * scd,
+                              mask=k_mask, other=0.0).to(tl.float32)
+                diff_d = xd[:, None] - cd[None, :]
+                dist += diff_d * diff_d
+            dist = tl.where(k_mask[None, :], dist, float("inf"))
+            block_min = tl.min(dist, axis=1)
+            block_arg = tl.argmin(dist, axis=1)
+            is_new = block_min < best_dist
+            best_dist = tl.where(is_new, block_min, best_dist)
+            best_idx = tl.where(is_new, (k_start + block_arg).to(tl.int32), best_idx)
+
+        tl.store(Out_ptr + offs_n, best_idx, mask=n_mask)
+
+
+def vq_assign(x, centroids):
+    N, D = x.shape
+    K, D2 = centroids.shape
+    assert D == D2
+    if not (HAS_TRITON and x.is_cuda):
+        return torch.cdist(x, centroids).argmin(dim=1)
+
+    out = torch.empty(N, dtype=torch.int32, device=x.device)
+    BN, BK = 128, 32
+    grid = (triton.cdiv(N, BN),)
+    _vq_assign_kernel[grid](
+        x.contiguous(), centroids.contiguous(), out,
+        N, K, D,
+        x.stride(0), x.stride(1),
+        centroids.stride(0), centroids.stride(1),
+        BN=BN, BK=BK,
+    )
+    return out.long()
+
+
+# ---------------------------------------------------------------------------
+# Undo-RoPE fused kernel
+# ---------------------------------------------------------------------------
+
+if HAS_TRITON:
+    @triton.jit
+    def _undo_rope_kernel(
+        X_ptr, Cos_ptr, Sin_ptr, Out_ptr,
+        N, hd: tl.constexpr, hd_half: tl.constexpr,
+        sxn, sxd,
+        scn, scd,
+        son, sod,
+        BN: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_n = pid * BN + tl.arange(0, BN)
+        n_mask = offs_n < N
+        offs_lo = tl.arange(0, hd_half)
+        offs_hi = hd_half + tl.arange(0, hd_half)
+
+        x_lo = tl.load(X_ptr + offs_n[:, None] * sxn + offs_lo[None, :] * sxd,
+                        mask=n_mask[:, None], other=0.0).to(tl.float32)
+        x_hi = tl.load(X_ptr + offs_n[:, None] * sxn + offs_hi[None, :] * sxd,
+                        mask=n_mask[:, None], other=0.0).to(tl.float32)
+        cos_lo = tl.load(Cos_ptr + offs_n[:, None] * scn + offs_lo[None, :] * scd,
+                          mask=n_mask[:, None], other=0.0).to(tl.float32)
+        sin_lo = tl.load(Sin_ptr + offs_n[:, None] * scn + offs_lo[None, :] * scd,
+                          mask=n_mask[:, None], other=0.0).to(tl.float32)
+
+        out_lo = x_lo * cos_lo + x_hi * sin_lo
+        out_hi = x_hi * cos_lo - x_lo * sin_lo
+        tl.store(Out_ptr + offs_n[:, None] * son + offs_lo[None, :] * sod,
+                  out_lo.to(tl.float16), mask=n_mask[:, None])
+        tl.store(Out_ptr + offs_n[:, None] * son + offs_hi[None, :] * sod,
+                  out_hi.to(tl.float16), mask=n_mask[:, None])
+
+
+def undo_rope_fused(x, cos, sin):
+    shape = x.shape
+    hd = shape[-1]
+    x_flat = x.reshape(-1, hd).contiguous()
+    cos_flat = cos.expand_as(x).reshape(-1, hd).contiguous()
+    sin_flat = sin.expand_as(x).reshape(-1, hd).contiguous()
+    N = x_flat.shape[0]
+
+    if not (HAS_TRITON and x.is_cuda):
+        hd_half = hd // 2
+        x_lo, x_hi = x_flat[:, :hd_half].float(), x_flat[:, hd_half:].float()
+        c, s = cos_flat[:, :hd_half].float(), sin_flat[:, :hd_half].float()
+        out = torch.empty_like(x_flat, dtype=torch.float16)
+        out[:, :hd_half] = (x_lo * c + x_hi * s).half()
+        out[:, hd_half:] = (x_hi * c - x_lo * s).half()
+        return out.reshape(*shape)
+
+    out = torch.empty_like(x_flat, dtype=torch.float16)
+    BN = 128
+    grid = (triton.cdiv(N, BN),)
+    _undo_rope_kernel[grid](
+        x_flat.to(torch.float16), cos_flat.to(torch.float16), sin_flat.to(torch.float16), out,
+        N, hd, hd // 2,
+        x_flat.stride(0), x_flat.stride(1),
+        cos_flat.stride(0), cos_flat.stride(1),
+        out.stride(0), out.stride(1),
+        BN=BN,
+    )
+    return out.reshape(*shape)
