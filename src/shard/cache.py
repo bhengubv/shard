@@ -8,6 +8,7 @@ from .rope import (dp_bit_allocation, quantize_group, dequantize_group,
                    pack_nbits, unpack_nbits)
 
 def hadamard(x):
+    # normalized butterfly WHT; self-inverse on last dim (power of 2)
     d = x.shape[-1]
     h = 1
     while h < d:
@@ -18,12 +19,13 @@ def hadamard(x):
     return x / math.sqrt(d)
 
 def kmeans(data, k, n_iter=30, seed=42):
+    from .triton_kernels import vq_assign
     n, d = data.shape
     dev = data.device
     g = torch.Generator(device=dev).manual_seed(seed)
     centroids = data[torch.randperm(n, generator=g, device=dev)[:k]].clone()
     for it in range(n_iter):
-        idx = torch.cdist(data, centroids).argmin(dim=1)
+        idx = vq_assign(data, centroids)
         new = torch.zeros_like(centroids)
         counts = torch.zeros(k, device=dev, dtype=data.dtype)
         new.index_add_(0, idx, data)
@@ -37,6 +39,7 @@ def kmeans(data, k, n_iter=30, seed=42):
     return centroids, idx
 
 def vq_encode(v, group_size, codebook_size):
+    # per-channel normalize, group channels, k-means each group
     bh, seq, hd = v.shape
     ng = hd // group_size
     ch_max = v.abs().amax(dim=1).clamp(min=1e-8)
@@ -69,6 +72,7 @@ class CacheLayer(CacheLayerMixin):
         self._needs_decompress = False
 
     def _lazy_evict(self):
+        # keep ~1 layer's FP16 K/V materialized during decode
         c = self._cache_ref
         if c is None or not c._lazy_per_layer: return
         last = c._last_accessed_layer
@@ -85,6 +89,7 @@ class CacheLayer(CacheLayerMixin):
         gc = getattr(self, "_gpu_compressed", None)
         if gc is None: return
 
+        # K: unpack int4 → scale → basis (int8·scale) → + mean → reapply RoPE
         packed = gc["k_coeffs"]
         lo = (packed & 0x0F).to(torch.float16) - 8.0
         hi = ((packed >> 4) & 0x0F).to(torch.float16) - 8.0
@@ -110,6 +115,8 @@ class CacheLayer(CacheLayerMixin):
 
         parts_k = [gc["sink_k"], k_mid, gc["win_k"]]
         parts_v = [gc["sink_v"], v_mid, gc["win_v"]]
+        sk, sv = self._dequant_stream(gc, B, nkv, hd)
+        if sk is not None: parts_k.append(sk); parts_v.append(sv)
         if "decode_k" in gc: parts_k.append(gc["decode_k"]); parts_v.append(gc["decode_v"])
 
         self._keys = torch.cat(parts_k, dim=2)
@@ -139,13 +146,27 @@ class CacheLayer(CacheLayerMixin):
             self._values = value_states
             return key_states, value_states
 
+        # first decode step triggers prefill compression
         if self.layer_idx == 0 and c is not None and not c._compressed:
             c.compress()
 
         self._lazy_evict()
         gc = getattr(self, "_gpu_compressed", None)
 
+        if gc is not None and c._streaming:
+            for t in range(seq_new):
+                self._stream_append(key_states[:, :, t:t+1, :],
+                                     value_states[:, :, t:t+1, :],
+                                     self._seq_len + t)
+            self._seq_len += seq_new
+            self._needs_decompress = True
+            if getattr(c, "_fused_decode_update", False):
+                return key_states, value_states
+            self._ensure_dequant()
+            return self._keys, self._values
+
         if gc is not None:
+            # append to gc's FP16 decode buffer so lazy eviction can drop self._keys safely
             if "decode_k" in gc:
                 gc["decode_k"] = torch.cat([gc["decode_k"], key_states], dim=2)
                 gc["decode_v"] = torch.cat([gc["decode_v"], value_states], dim=2)
@@ -154,6 +175,8 @@ class CacheLayer(CacheLayerMixin):
                 gc["decode_v"] = value_states
             self._seq_len += seq_new
             self._needs_decompress = True
+            if getattr(c, "_fused_decode_update", False):
+                return key_states, value_states
             self._ensure_dequant()
             return self._keys, self._values
 
@@ -166,18 +189,6 @@ class CacheLayer(CacheLayerMixin):
             self._keys = key_states
             self._values = value_states
         return self._keys, self._values
-
-    def get_seq_length(self): return self._seq_len
-    def get_max_cache_shape(self): return None
-    def get_mask_sizes(self, query_length): return self._seq_len + query_length, 0
-    def lazy_initialization(self, *args, **kwargs): pass
-
-    def reorder_cache(self, beam_idx):
-        if self._needs_decompress: _ = self.keys
-        if self._keys is not None:
-            self._keys = self._keys.index_select(0, beam_idx.to(self._keys.device))
-        if self._values is not None:
-            self._values = self._values.index_select(0, beam_idx.to(self._values.device))
 
     def _stream_append(self, k, v, position):
         from .streaming import quantize_per_token
@@ -203,39 +214,63 @@ class CacheLayer(CacheLayerMixin):
         k_idx, k_qs, k_qsc = quantize_per_token(k_u, bits, signs, qjl=qjl)
         v_idx, v_qs, v_qsc = quantize_per_token(v_u, bits, signs, qjl=qjl)
 
-        def _add(key, val):
-            gc[key] = val if key not in gc else torch.cat([gc[key], val])
+        s = gc.get("stream_n", 0) // B
+        needed = s + 1
 
-        _add("k_idx", k_idx.reshape(-1))
-        _add("v_idx", v_idx.reshape(-1))
-        _add("k_norm", k_n.reshape(-1).half())
-        _add("v_norm", v_n.reshape(-1).half())
+        def _ensure(key, shape, dtype):
+            buf_key = f"{key}_buf"
+            buf = gc.get(buf_key)
+            if buf is not None and buf.shape[0] >= needed:
+                return buf
+            cap = max(needed, 16 if buf is None else buf.shape[0] * 2)
+            new = torch.empty((cap, *shape), device=k.device, dtype=dtype)
+            if buf is not None:
+                new[:buf.shape[0]].copy_(buf)
+            gc[buf_key] = new
+            return new
+
+        _ensure("k_idx", (B, heads, hd), torch.uint8)[s].copy_(k_idx)
+        _ensure("v_idx", (B, heads, hd), torch.uint8)[s].copy_(v_idx)
+        _ensure("k_norm", (B, heads), torch.float16)[s].copy_(k_n.half())
+        _ensure("v_norm", (B, heads), torch.float16)[s].copy_(v_n.half())
         if qjl:
-            _add("k_qsign", k_qs.reshape(-1))
-            _add("v_qsign", v_qs.reshape(-1))
-            _add("k_qscale", k_qsc.reshape(-1))
-            _add("v_qscale", v_qsc.reshape(-1))
+            _ensure("k_qsign", (B, heads, hd), torch.uint8)[s].copy_(k_qs)
+            _ensure("v_qsign", (B, heads, hd), torch.uint8)[s].copy_(v_qs)
+            _ensure("k_qscale", (B, heads), torch.float16)[s].copy_(k_qsc)
+            _ensure("v_qscale", (B, heads), torch.float16)[s].copy_(v_qsc)
         gc["stream_n"] = gc.get("stream_n", 0) + B
 
     def _dequant_stream(self, gc, B, nkv, hd):
         n = gc.get("stream_n", 0)
-        if n == 0 or "k_idx" not in gc: return None, None
+        if n == 0 or ("k_idx" not in gc and "k_idx_buf" not in gc): return None, None
         from .streaming import dequantize_per_token
         c = self._cache_ref
         bits, qjl = c._stream_bits, c._stream_qjl
         signs = gc["signs"]
         s = n // B
 
-        k_idx = gc["k_idx"].view(s, B, nkv, hd)
-        v_idx = gc["v_idx"].view(s, B, nkv, hd)
-        k_n = gc["k_norm"].view(s, B, nkv).float()
-        v_n = gc["v_norm"].view(s, B, nkv).float()
+        if "k_idx_buf" in gc:
+            k_idx = gc["k_idx_buf"][:s]
+            v_idx = gc["v_idx_buf"][:s]
+            k_n = gc["k_norm_buf"][:s].float()
+            v_n = gc["v_norm_buf"][:s].float()
+        else:
+            k_idx = gc["k_idx"].view(s, B, nkv, hd)
+            v_idx = gc["v_idx"].view(s, B, nkv, hd)
+            k_n = gc["k_norm"].view(s, B, nkv).float()
+            v_n = gc["v_norm"].view(s, B, nkv).float()
         k_qs = v_qs = k_qsc = v_qsc = None
-        if qjl and "k_qsign" in gc:
-            k_qs = gc["k_qsign"].view(s, B, nkv, hd)
-            v_qs = gc["v_qsign"].view(s, B, nkv, hd)
-            k_qsc = gc["k_qscale"].view(s, B, nkv)
-            v_qsc = gc["v_qscale"].view(s, B, nkv)
+        if qjl and ("k_qsign" in gc or "k_qsign_buf" in gc):
+            if "k_qsign_buf" in gc:
+                k_qs = gc["k_qsign_buf"][:s]
+                v_qs = gc["v_qsign_buf"][:s]
+                k_qsc = gc["k_qscale_buf"][:s]
+                v_qsc = gc["v_qscale_buf"][:s]
+            else:
+                k_qs = gc["k_qsign"].view(s, B, nkv, hd)
+                v_qs = gc["v_qsign"].view(s, B, nkv, hd)
+                k_qsc = gc["k_qscale"].view(s, B, nkv)
+                v_qsc = gc["v_qscale"].view(s, B, nkv)
 
         k_u = dequantize_per_token(k_idx, bits, signs, k_qs, k_qsc).float()
         v_u = dequantize_per_token(v_idx, bits, signs, v_qs, v_qsc).float()
@@ -243,9 +278,26 @@ class CacheLayer(CacheLayerMixin):
         sv = (v_u * v_n.unsqueeze(-1)).half().permute(1, 2, 0, 3).contiguous()
         return sk, sv
 
+    # HF Cache API glue
+    def get_seq_length(self): return self._seq_len
+    def get_max_cache_shape(self): return None
+    def get_mask_sizes(self, query_length): return self._seq_len + query_length, 0
+    def lazy_initialization(self, *args, **kwargs): pass
+
+    def reorder_cache(self, beam_idx):
+        if self._needs_decompress: _ = self.keys
+        if self._keys is not None:
+            self._keys = self._keys.index_select(0, beam_idx.to(self._keys.device))
+        if self._values is not None:
+            self._values = self._values.index_select(0, beam_idx.to(self._values.device))
+
 
 class Cache(HFCache):
-    """KV cache compression with optional TurboQuant-style 8-bit decode streaming."""
+    """KV cache compression.
+    Prefill: per-layer online PCA on K (RoPE-removed, int4 coeffs + int8 basis)
+    + Hadamard + K-means VQ on V. Sink (4) + window (64) kept FP16.
+    Decode: optional TurboQuant-style streaming quantizer (8-bit = lossless).
+    """
     def __init__(self, head_dim=128, num_layers=32, n_kv_heads=8, device="cuda",
                  k_target_cr=20.0, max_rank_k=192,
                  v_vq_group_size=4, v_vq_codebook_size=256,
@@ -265,6 +317,7 @@ class Cache(HFCache):
         self._stream_bits = 8
         self._stream_qjl = False
         self._lazy_per_layer = True
+        self._full_fused = False
         self._last_accessed_layer = -1
         self._compressed = False
         self._compressed_layers = {}
@@ -313,6 +366,7 @@ class Cache(HFCache):
         self._compressed = True
 
     def _compress_k(self, k_mid, positions, B, n_comp):
+        # undo RoPE → PCA → int8 basis + DP-allocated coefficient quantization
         k = (undo_rope(k_mid.float(), positions, self._rope_inv_freq)
              if self._rope_inv_freq is not None else k_mid.float())
         flat = k.permute(0, 2, 1, 3).reshape(B * n_comp, self._per_layer_dim)
@@ -340,6 +394,7 @@ class Cache(HFCache):
                 "k_n_total": B * n_comp}
 
     def _compress_v(self, v_mid, B):
+        # Hadamard rotate → group-wise K-means VQ
         bh = B * self._n_kv_heads
         flat = v_mid.float().reshape(bh, v_mid.shape[2], self.head_dim)
         return {"v_qdata": vq_encode(hadamard(flat),
@@ -347,6 +402,7 @@ class Cache(HFCache):
                                        self._v_vq_codebook_size)}
 
     def _build_gpu_format(self):
+        # stage compressed data to GPU in final layout; int4-pack K coefficients
         for li in range(self._num_layers):
             data = self._compressed_layers.get(li)
             if data is None: continue
@@ -354,15 +410,19 @@ class Cache(HFCache):
             n_total = data["k_n_total"]
             keep = len(data["k_alloc"])
 
+            from .triton_kernels import int4_pack
             coeffs = dequantize_group(data["k_bytes"], data["k_alloc"], n_total, dev)
             col_max = coeffs.abs().amax(dim=0).clamp(min=1e-6)
             coeff_scale = col_max / 7.0
-            q = (coeffs / coeff_scale).round().clamp(-7, 7)
-            shifted = (q + 8).to(torch.uint8)
-            flat = shifted.reshape(-1)
-            if flat.shape[0] % 2:
-                flat = torch.cat([flat, torch.zeros(1, dtype=torch.uint8, device=dev)])
-            k_coeffs = flat[0::2] | (flat[1::2] << 4)
+            q = (coeffs / coeff_scale).round().clamp(-7, 7).to(torch.int8)
+            k_coeffs = int4_pack(q)
+
+            qd = data["v_qdata"]
+            gs = qd["group_size"]
+            ng = self.head_dim // gs
+            v_idx = unpack_nbits(qd["packed"].to(dev), qd["bits"], qd["n_orig"])
+            v_idx = v_idx[:self._n_kv_heads * data["n_compress"] * ng]
+            v_idx = v_idx.view(self._n_kv_heads, data["n_compress"], ng)
 
             layer = self.layers[li]
             layer._gpu_compressed = {
@@ -371,9 +431,17 @@ class Cache(HFCache):
                 "k_coeffs_shape": (n_total, keep),
                 "k_basis_q": data["k_basis_q"][:, :keep].to(dev),
                 "k_basis_scale": data["k_scale"][:keep].to(dev),
+                "k_basis_f16": (data["k_basis_q"][:, :keep].to(dev).to(torch.float16)
+                                * data["k_scale"][:keep].to(dev).to(torch.float16)).contiguous(),
                 "k_mean": data["k_mean"].to(dev),
+                "k_mean_f16": data["k_mean"].to(dev).to(torch.float16).contiguous(),
                 "v_qdata": data["v_qdata"],
                 "v_packed": data["v_qdata"]["packed"].to(dev),
+                "v_indices_u8": v_idx.to(torch.uint8).contiguous(),
+                "v_centroids_f16": qd["centroids"].to(dev).to(torch.float16).contiguous(),
+                "v_ch_f16": qd["ch_maxabs"].to(dev)
+                          .view(self._n_kv_heads, self.head_dim)
+                          .to(torch.float16).contiguous(),
                 "sink_k": data["sink_k"].to(dev),
                 "sink_v": data["sink_v"].to(dev),
                 "win_k": data["win_k"].to(dev),
@@ -401,15 +469,47 @@ class Cache(HFCache):
                          ["k_coeffs", "k_coeff_scale", "k_basis_q",
                           "k_basis_scale", "k_mean", "v_packed",
                           "sink_k", "sink_v", "win_k", "win_v"])
+            for k in ["k_basis_f16", "k_mean_f16", "v_indices_u8",
+                      "v_centroids_f16", "v_ch_f16"]:
+                if k in gc: total += nb(gc[k])
+            for k, v in gc.items():
+                if k.endswith("_f32") and torch.is_tensor(v):
+                    total += nb(v)
             total += nb(gc["v_qdata"]["ch_maxabs"])
             if gc["v_qdata"].get("centroids") is not None:
                 total += nb(gc["v_qdata"]["centroids"])
-            if "k_idx" in gc:
+            if "k_idx_buf" in gc:
+                s = gc.get("stream_n", 0) // max(gc.get("batch", 1), 1)
+                bpv = self._stream_bits / 8.0
+                for k in ["k_idx_buf", "v_idx_buf"]:
+                    total += int(gc[k][:s].nelement() * bpv)
+                for k in ["k_norm_buf", "v_norm_buf"]:
+                    total += nb(gc[k][:s])
+            elif "k_idx" in gc:
                 bpv = self._stream_bits / 8.0
                 for k in ["k_idx", "v_idx"]: total += int(gc[k].nelement() * bpv)
                 for k in ["k_norm", "v_norm"]: total += nb(gc[k])
             if "decode_k" in gc:
                 total += nb(gc["decode_k"]) + nb(gc["decode_v"])
+        if has_gc: return total
+        return sum(nb(l._keys) + nb(l._values) for l in self.layers if l._keys is not None)
+
+    def clean_memory_bytes(self):
+        """Storage-only compressed KV size, excluding runtime decode scratch caches."""
+        def nb(t): return t.nelement() * t.element_size()
+        total = 0
+        has_gc = False
+        for l in self.layers:
+            gc = getattr(l, "_gpu_compressed", None)
+            if gc is None: continue
+            has_gc = True
+            total += sum(nb(gc[k]) for k in
+                         ["k_coeffs", "k_coeff_scale", "k_basis_q",
+                          "k_basis_scale", "k_mean", "v_packed",
+                          "sink_k", "sink_v", "win_k", "win_v"])
+            total += nb(gc["v_qdata"]["ch_maxabs"])
+            if gc["v_qdata"].get("centroids") is not None:
+                total += nb(gc["v_qdata"]["centroids"])
         if has_gc: return total
         return sum(nb(l._keys) + nb(l._values) for l in self.layers if l._keys is not None)
 
@@ -423,7 +523,15 @@ class Cache(HFCache):
             seq = self.layers[0]._keys.shape[2]
         else:
             return 0
-        return seq * self._n_kv_heads * self.head_dim * 4 * self._num_layers
+        return seq * self._n_kv_heads * self.head_dim * 4 * self._num_layers  # 2B × (K+V)
 
     def compress_ratio(self):
         return self.fp16_equivalent_bytes() / max(self.memory_bytes(), 1)
+
+    def clean_compress_ratio(self):
+        gc = getattr(self.layers[0], "_gpu_compressed", None)
+        if gc is not None:
+            seq = gc["n_compress"] + self._sink_tokens + self._residual_window
+            fp16_bytes = seq * self._n_kv_heads * self.head_dim * 4 * self._num_layers
+            return fp16_bytes / max(self.clean_memory_bytes(), 1)
+        return self.compress_ratio()
