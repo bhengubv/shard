@@ -88,13 +88,28 @@ def _v_weighted_sum_compressed(weights_mid, gc, B, nkv, n_comp, hd):
     """
     from .cache import hadamard
     from .rope import unpack_nbits
-    from .triton_kernels import HAS_TRITON
+    from .triton_kernels import vq_weighted_sum_all, HAS_TRITON
 
     qd = gc["v_qdata"]
     gs = qd["group_size"]
     ng = hd // gs
     gqa = weights_mid.shape[1] // nkv
     S = weights_mid.shape[2]
+
+    if HAS_TRITON and weights_mid.is_cuda and B == 1 and S == 1:
+        idx_u8 = gc.get("v_indices_u8")
+        cb = gc.get("v_centroids_f16")
+        ch_fp16 = gc.get("v_ch_f16")
+        if idx_u8 is None or cb is None or ch_fp16 is None:
+            idx = unpack_nbits(qd["packed"].to(weights_mid.device), qd["bits"], qd["n_orig"])
+            idx_u8 = idx[:nkv * n_comp * ng].view(nkv, n_comp, ng).to(torch.uint8).contiguous()
+            cb = qd["centroids"].to(weights_mid.device).to(torch.float16).contiguous()
+            ch_fp16 = qd["ch_maxabs"].to(weights_mid.device).view(nkv, hd).to(torch.float16).contiguous()
+        # weights_mid (1, n_q, 1, n_comp) → (n_q, n_comp) with grouped KV head layout
+        w_flat = weights_mid.view(nkv * gqa, n_comp).to(torch.float32).contiguous()
+        out_flat = vq_weighted_sum_all(w_flat, idx_u8, cb, ch_fp16, gqa)
+        out_rot = out_flat.view(1, nkv * gqa, 1, hd)
+        return hadamard(out_rot.to(torch.float16)).float()
 
     idx = unpack_nbits(qd["packed"].to(weights_mid.device), qd["bits"], qd["n_orig"])
     centroids = qd["centroids"].to(weights_mid.device)

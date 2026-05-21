@@ -161,6 +161,96 @@ def _vq_weighted_sum_torch(weights, indices, codebook, ch_max):
     return weights.to(torch.float32) @ v_rot.to(torch.float32)
 
 
+
+# ---------------------------------------------------------------------------
+# All-heads VQ weighted sum — single launch handles every KV head at once.
+# ---------------------------------------------------------------------------
+
+if HAS_TRITON:
+    @triton.jit
+    def _vq_weighted_sum_all_kernel(
+        W_ptr,
+        Idx_ptr,
+        Cb_ptr,
+        Ch_ptr,
+        Out_ptr,
+        N, D, G, gs,
+        gqa: tl.constexpr,
+        swh, swn,
+        sik, sin_, sig,
+        scc, scg,
+        sck, scd,
+        soh, sod,
+        BH: tl.constexpr, BD: tl.constexpr, BN: tl.constexpr,
+    ):
+        pid_kv = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        offs_h = pid_kv * gqa + tl.arange(0, BH)
+        offs_d = pid_d * BD + tl.arange(0, BD)
+        h_mask = tl.arange(0, BH) < gqa
+        d_mask = offs_d < D
+
+        g_idx = offs_d // gs
+        g_pos = offs_d % gs
+
+        ch = tl.load(Ch_ptr + pid_kv * sck + offs_d * scd,
+                      mask=d_mask, other=0.0).to(tl.float32)
+
+        acc = tl.zeros((BH, BD), dtype=tl.float32)
+        for n_start in range(0, N, BN):
+            offs_n = n_start + tl.arange(0, BN)
+            n_mask = offs_n < N
+
+            idx = tl.load(Idx_ptr + pid_kv * sik
+                           + offs_n[:, None] * sin_
+                           + g_idx[None, :] * sig,
+                           mask=n_mask[:, None] & d_mask[None, :], other=0).to(tl.int64)
+            v_rot = tl.load(Cb_ptr + idx * scc + g_pos[None, :] * scg,
+                             mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            v_rot = v_rot * ch[None, :]
+
+            w = tl.load(W_ptr + offs_h[:, None] * swh + offs_n[None, :] * swn,
+                         mask=h_mask[:, None] & n_mask[None, :], other=0.0)
+
+            acc += tl.dot(w, v_rot, input_precision="ieee")
+
+        tl.store(Out_ptr + offs_h[:, None] * soh + offs_d[None, :] * sod,
+                  acc, mask=h_mask[:, None] & d_mask[None, :])
+
+
+def vq_weighted_sum_all(weights, indices, codebook, ch_max, gqa):
+    """All-KV-head VQ weighted sum in one launch."""
+    assert weights.is_contiguous() and indices.is_contiguous()
+    assert codebook.is_contiguous() and ch_max.is_contiguous()
+    HQ, N = weights.shape
+    nkv, N2, G = indices.shape
+    C, gs = codebook.shape
+    D = G * gs
+    assert HQ == nkv * gqa
+
+    if not (HAS_TRITON and weights.is_cuda):
+        idx_l = indices.long()
+        v_rot = codebook.float()[idx_l].reshape(nkv, N, D) * ch_max.float().unsqueeze(1)
+        v_rot_q = v_rot.unsqueeze(1).expand(nkv, gqa, N, D).reshape(HQ, N, D)
+        return torch.einsum("qn,qnd->qd", weights, v_rot_q)
+
+    out = torch.empty(HQ, D, dtype=torch.float32, device=weights.device)
+    BH, BD, BN = max(16, gqa), 64, 64
+    grid = (nkv, triton.cdiv(D, BD))
+    _vq_weighted_sum_all_kernel[grid](
+        weights, indices, codebook, ch_max, out,
+        N, D, G, gs,
+        gqa,
+        weights.stride(0), weights.stride(1),
+        indices.stride(0), indices.stride(1), indices.stride(2),
+        codebook.stride(0), codebook.stride(1),
+        ch_max.stride(0), ch_max.stride(1),
+        out.stride(0), out.stride(1),
+        BH=BH, BD=BD, BN=BN,
+    )
+    return out
+
+
 def hadamard(x):
     d = x.shape[-1]
     h = 1
