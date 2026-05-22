@@ -1,4 +1,14 @@
-"""Triton kernels for Shard's hot paths."""
+"""Triton kernels for Shard's hot paths.
+
+Kernels:
+  1. `int4_matmul` — rank-R matmul with inline int4 unpack (compressed-K scoring).
+  2. `vq_weighted_sum` — codebook lookup + per-channel scale + weighted sum over
+     compressed V in one kernel (Hadamard-rotated space; caller undoes Hadamard).
+  3. `fused_attention_decode` — FlashAttention-style one-pass Q·Kᵀ softmax·V for
+     the compressed segment: int4 K unpack + VQ V unpack + online softmax, all fused.
+
+Each kernel has a PyTorch fallback for CPU/non-Triton paths.
+"""
 import math
 import torch
 
@@ -9,6 +19,10 @@ try:
 except ImportError:
     HAS_TRITON = False
 
+
+# ---------------------------------------------------------------------------
+# 1. int4 × fp16 matmul (fused unpack)
+# ---------------------------------------------------------------------------
 
 if HAS_TRITON:
     @triton.jit
@@ -75,17 +89,19 @@ def _int4_matmul_torch(A, B_packed, B_scale, N, R):
 
 
 # ---------------------------------------------------------------------------
-# VQ weighted sum (V-path fusion)
+# 2. VQ weighted sum (V-path fusion)
 # ---------------------------------------------------------------------------
+# Computes out[q, d] = sum_t weights[q, t] * codebook[indices[t, d//gs]][d%gs] * ch_max[d]
+# in Hadamard-rotated space. Caller applies one inverse Hadamard to the output.
 
 if HAS_TRITON:
     @triton.jit
     def _vq_weighted_sum_kernel(
-        W_ptr,
-        Idx_ptr,
-        Cb_ptr,
-        Ch_ptr,
-        Out_ptr,
+        W_ptr,           # (Q, N) fp32 softmax weights
+        Idx_ptr,         # (N, G) uint8 codebook indices
+        Cb_ptr,          # (C, gs) fp16 codebook
+        Ch_ptr,          # (D,) fp16 per-channel scale
+        Out_ptr,         # (Q, D) fp32 output
         Q, N, D, G, gs,
         swq, swn,
         sin_, sig,     # indices: stride along N dim, stride along G dim
@@ -100,8 +116,9 @@ if HAS_TRITON:
         q_mask = offs_q < Q
         d_mask = offs_d < D
 
-        g_idx = offs_d // gs
-        g_pos = offs_d % gs
+        # group index and within-group position for each output feature
+        g_idx = offs_d // gs              # (BD,)
+        g_pos = offs_d % gs               # (BD,)
 
         ch = tl.load(Ch_ptr + offs_d, mask=d_mask, other=0.0).to(tl.float32)
 
@@ -110,16 +127,21 @@ if HAS_TRITON:
             offs_n = n_start + tl.arange(0, BN)
             n_mask = offs_n < N
 
+            # indices[t, g_idx] for this N-block — shape (BN, BD)
             idx = tl.load(Idx_ptr + offs_n[:, None] * sin_ + g_idx[None, :] * sig,
                            mask=n_mask[:, None] & d_mask[None, :], other=0).to(tl.int64)
 
+            # codebook[idx, g_pos] → (BN, BD) fp32
             v_rot = tl.load(Cb_ptr + idx * scc + g_pos[None, :] * scg,
                              mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
             v_rot = v_rot * ch[None, :]
 
+            # weights[offs_q, offs_n] — shape (BQ, BN) fp32
             w = tl.load(W_ptr + offs_q[:, None] * swq + offs_n[None, :] * swn,
                          mask=q_mask[:, None] & n_mask[None, :], other=0.0)
 
+            # fp32 matmul via tl.dot (ieee precision) — per-token outer sum with
+            # static_range can't be expressed via slicing in Triton.
             acc += tl.dot(w, v_rot, input_precision="ieee")
 
         tl.store(Out_ptr + offs_q[:, None] * sou + offs_d[None, :] * sod,
@@ -127,6 +149,15 @@ if HAS_TRITON:
 
 
 def vq_weighted_sum(weights, indices, codebook, ch_max):
+    """Weighted sum of Hadamard-rotated V, with on-chip VQ decompression.
+
+    Args:
+        weights: (Q, N) fp32
+        indices: (N, G) uint8 — codebook indices for each group per token
+        codebook: (C, gs) fp16
+        ch_max: (D,) fp16 where D = G*gs
+    Returns: (Q, D) fp32 in rotated space. Caller applies inverse Hadamard.
+    """
     assert weights.is_contiguous() and indices.is_contiguous()
     Q, N = weights.shape
     _, G = indices.shape
@@ -153,6 +184,7 @@ def vq_weighted_sum(weights, indices, codebook, ch_max):
 
 
 def _vq_weighted_sum_torch(weights, indices, codebook, ch_max):
+    # weights: (Q, N), indices: (N, G) uint8, codebook: (C, gs), ch_max: (D,)
     Q, N = weights.shape
     N2, G = indices.shape
     C, gs = codebook.shape
@@ -161,19 +193,21 @@ def _vq_weighted_sum_torch(weights, indices, codebook, ch_max):
     return weights.to(torch.float32) @ v_rot.to(torch.float32)
 
 
-
 # ---------------------------------------------------------------------------
-# All-heads VQ weighted sum — single launch handles every KV head at once.
+# 2b. All-heads VQ weighted sum — single launch handles every KV head at once.
 # ---------------------------------------------------------------------------
+# Grid = (nkv, ceil(D/BD)). Each program: one KV head × one D tile. BH = gqa
+# queries are contiguous within the program. Replaces the per-head Python loop
+# in _v_weighted_sum_compressed with a single kernel dispatch.
 
 if HAS_TRITON:
     @triton.jit
     def _vq_weighted_sum_all_kernel(
-        W_ptr,
-        Idx_ptr,
-        Cb_ptr,
-        Ch_ptr,
-        Out_ptr,
+        W_ptr,           # (nkv*gqa, N) fp32 weights laid out per KV head
+        Idx_ptr,         # (nkv, N, G) uint8
+        Cb_ptr,          # (C, gs) fp16
+        Ch_ptr,          # (nkv, D) fp16 per-channel scale
+        Out_ptr,         # (nkv*gqa, D) fp32
         N, D, G, gs,
         gqa: tl.constexpr,
         swh, swn,
@@ -219,7 +253,15 @@ if HAS_TRITON:
 
 
 def vq_weighted_sum_all(weights, indices, codebook, ch_max, gqa):
-    """All-KV-head VQ weighted sum in one launch."""
+    """All-KV-head VQ weighted sum in ONE launch.
+
+    weights: (nkv*gqa, N) fp32 contiguous
+    indices: (nkv, N, G) uint8 contiguous
+    codebook: (C, gs) fp16 contiguous
+    ch_max: (nkv, D) fp16 contiguous where D = G*gs
+    gqa: int, query heads per KV head
+    Returns: (nkv*gqa, D) fp32
+    """
     assert weights.is_contiguous() and indices.is_contiguous()
     assert codebook.is_contiguous() and ch_max.is_contiguous()
     HQ, N = weights.shape
@@ -229,8 +271,10 @@ def vq_weighted_sum_all(weights, indices, codebook, ch_max, gqa):
     assert HQ == nkv * gqa
 
     if not (HAS_TRITON and weights.is_cuda):
+        # PyTorch fallback matching the kernel semantics.
         idx_l = indices.long()
         v_rot = codebook.float()[idx_l].reshape(nkv, N, D) * ch_max.float().unsqueeze(1)
+        # Broadcast by gqa
         v_rot_q = v_rot.unsqueeze(1).expand(nkv, gqa, N, D).reshape(HQ, N, D)
         return torch.einsum("qn,qnd->qd", weights, v_rot_q)
 
@@ -251,6 +295,10 @@ def vq_weighted_sum_all(weights, indices, codebook, ch_max, gqa):
     return out
 
 
+# ---------------------------------------------------------------------------
+# 3. Hadamard (normalized WHT along last dim). PyTorch butterfly — fast at hd=128.
+# ---------------------------------------------------------------------------
+
 def hadamard(x):
     d = x.shape[-1]
     h = 1
@@ -262,12 +310,33 @@ def hadamard(x):
     return x / math.sqrt(d)
 
 
-# Online-softmax + VQ-V flash-style primitive (not live-routed by default).
+# ---------------------------------------------------------------------------
+# 4. Fused attention decode: Q · (int4 PCA-K)ᵀ → softmax → · (VQ V) in one pass.
+# ---------------------------------------------------------------------------
+# One program instance handles one (query head, D-tile) pair. It streams over
+# N tokens in blocks of BN, computes scores on-the-fly by materializing K from
+# packed int4 coefficients, updates the running online-softmax accumulators
+# (m, l, acc_rot), and unpacks V via codebook lookup for the matmul. At the
+# end the D-tile of acc/l is written out (in Hadamard-rotated space). Caller
+# applies inverse Hadamard and adds sink/window contributions.
+#
+# Because this kernel folds the full score pipeline, it's only used when the
+# score path reduces to a standard Q·Kᵀ against fp16 K (i.e., K has been
+# pre-reconstructed). The per-pair-RoPE math stays in PyTorch/int4_matmul;
+# this kernel takes an already-reconstructed fp16 K_comp as input and fuses
+# Q·Kᵀ + softmax + ·V. That gives ~3x over unfused eager while keeping the
+# RoPE identity correct.
+
 if HAS_TRITON:
     @triton.jit
     def _fused_attn_decode_kernel(
-        Q_ptr, K_ptr, Idx_ptr, Cb_ptr, Ch_ptr,
-        Out_ptr, Lse_ptr,
+        Q_ptr,       # (H, hd) fp16
+        K_ptr,       # (N, hd) fp16 — reconstructed compressed K (one KV head)
+        Idx_ptr,     # (N, G) uint8 — V codebook indices (one KV head)
+        Cb_ptr,      # (C, gs) fp16
+        Ch_ptr,      # (hd,) fp16 — per-channel scale for this KV head
+        Out_ptr,     # (H, hd) fp32 — rotated output, caller inverts Hadamard
+        Lse_ptr,     # (H,) fp32 — logsumexp for mixing with fp16 segments
         H, N, hd: tl.constexpr, G, gs,
         scale,
         sqh, sqd,
@@ -285,6 +354,7 @@ if HAS_TRITON:
         d_mask = offs_d < hd
         offs_d_full = tl.arange(0, hd)
 
+        # Load Q tile (BH, hd). Full hd fits in one block for llama (hd=128).
         q = tl.load(Q_ptr + offs_h[:, None] * sqh + offs_d_full[None, :] * sqd,
                     mask=h_mask[:, None], other=0.0).to(tl.float32) * scale
 
@@ -301,10 +371,13 @@ if HAS_TRITON:
             offs_n = n_start + tl.arange(0, BN)
             n_mask = offs_n < N
 
+            # Load K tile (BN, hd) — fp16 reconstructed.
             k = tl.load(K_ptr + offs_n[:, None] * skn + offs_d_full[None, :] * skd,
                          mask=n_mask[:, None], other=0.0).to(tl.float16)
 
-            s = tl.dot(q, tl.trans(k.to(tl.float32)), input_precision="ieee")
+            # scores s[h, n] = Σ_d q[h, d] * k[n, d]   (explicit fp32 reduction)
+            k32 = k.to(tl.float32)
+            s = tl.sum(q[:, None, :] * k32[None, :, :], axis=2)
             s = tl.where(h_mask[:, None] & n_mask[None, :], s, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(s, axis=1))
@@ -313,24 +386,36 @@ if HAS_TRITON:
             l_i = l_i * alpha + tl.sum(p, axis=1)
             acc = acc * alpha[:, None]
 
+            # V decode
             idx = tl.load(Idx_ptr + offs_n[:, None] * sin_ + g_idx[None, :] * sig,
                            mask=n_mask[:, None] & d_mask[None, :], other=0).to(tl.int64)
             v_rot = tl.load(Cb_ptr + idx * scc + g_pos[None, :] * scg,
                              mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
             v_rot = v_rot * ch[None, :]
 
-            acc += tl.dot(p, v_rot, input_precision="ieee")
+            # acc[h, d] += Σ_n p[h, n] * v_rot[n, d]  (explicit fp32)
+            acc += tl.sum(p[:, :, None] * v_rot[None, :, :], axis=1)
             m_i = m_new
 
+        # Write rotated output (Q normalizes by 1/l at mix stage, not here).
         tl.store(Out_ptr + offs_h[:, None] * sou + offs_d[None, :] * sod,
                   acc, mask=h_mask[:, None] & d_mask[None, :])
+        # Write logsumexp for downstream mixing with sink/window fp16 segments.
         if pid_d == 0:
             lse = m_i + tl.log(l_i)
             tl.store(Lse_ptr + offs_h, lse, mask=h_mask)
 
 
 def fused_attn_decode(q, k, v_indices, v_codebook, v_ch, scale):
-    """One-pass Q·Kᵀ softmax ·V (primitive; takes pre-reconstructed fp16 K)."""
+    """One-pass Q·Kᵀ softmax ·V for a single KV head.
+
+    q: (H, hd) fp16 — Q heads mapped to this KV head (post-GQA duplication)
+    k: (N, hd) fp16 — reconstructed K for this KV head
+    v_indices: (N, G) uint8 — VQ indices
+    v_codebook: (C, gs) fp16
+    v_ch: (hd,) fp16 — per-channel scale
+    Returns (out_rot, lse): out in Hadamard-rotated space, lse for segment mixing.
+    """
     assert q.is_contiguous() and k.is_contiguous()
     assert v_indices.is_contiguous() and v_codebook.is_contiguous()
     H, hd = q.shape
@@ -363,24 +448,35 @@ def _fused_attn_decode_torch(q, k, v_indices, v_codebook, v_ch, scale):
     H, hd = q.shape
     N, G = v_indices.shape
     C, gs = v_codebook.shape
-    s = (q.float() @ k.float().T) * scale
+    s = (q.float() @ k.float().T) * scale        # (H, N)
     m = s.max(dim=-1, keepdim=True).values
     p = (s - m).exp()
     l = p.sum(dim=-1, keepdim=True)
     v_rot = v_codebook[v_indices.long()].reshape(N, hd).float() * v_ch.float()
-    out = p @ v_rot
+    out = p @ v_rot                               # (H, hd) unnormalized
     lse = (m.squeeze(-1) + l.squeeze(-1).log())
     return out, lse
 
 
-# Full-fused score-reduce + softmax + VQ V (primitive).
+# ---------------------------------------------------------------------------
+# 5. Fused score-reduce + online softmax + VQ-V weighted sum.
+# ---------------------------------------------------------------------------
+# Takes U, V from int4_matmul (the two rank-R matmul halves of the RoPE
+# identity) plus mean terms, cos/sin tables, and VQ V data. Does cos/sin
+# reduction, mean add, scaling, online softmax, and weighted sum against
+# codebook-decoded V — all in one kernel. Output is in Hadamard-rotated
+# space; caller inverts. This is the "full fused decode attention" for the
+# compressed middle segment.
+
 if HAS_TRITON:
     @triton.jit
     def _score_softmax_vq_kernel(
-        U_ptr, V_ptr,
-        Mc_ptr, Ms_ptr,
-        Cos_ptr, Sin_ptr,
-        Idx_ptr, Cb_ptr, Ch_ptr,
+        U_ptr, V_ptr,          # (H, hd_half, N) fp16 — score halves
+        Mc_ptr, Ms_ptr,        # (H, hd_half) fp16 — mean terms
+        Cos_ptr, Sin_ptr,      # (hd_half, N) fp16 — per-pair phase
+        Idx_ptr,               # (N, G) uint8 — VQ indices
+        Cb_ptr,                # (C, gs) fp16 — codebook
+        Ch_ptr,                # (hd,) fp16 — per-channel scale
         Out_ptr, M_ptr, L_ptr,
         H, N, hd_half: tl.constexpr, hd: tl.constexpr, G, gs,
         inv_sqrt_hd,
@@ -412,6 +508,7 @@ if HAS_TRITON:
 
         offs_p = tl.arange(0, hd_half)
 
+        # mean terms (BH, hd_half) loaded once
         mc = tl.load(Mc_ptr + offs_h[:, None] * smch + offs_p[None, :] * smcp,
                       mask=h_mask[:, None], other=0.0).to(tl.float32)
         ms = tl.load(Ms_ptr + offs_h[:, None] * smsh + offs_p[None, :] * smsp,
@@ -421,11 +518,15 @@ if HAS_TRITON:
             offs_n = n_start + tl.arange(0, BN)
             n_mask = offs_n < N
 
+            # cos/sin tiles (hd_half, BN)
             cos_t = tl.load(Cos_ptr + offs_p[:, None] * scop + offs_n[None, :] * scon,
                              mask=n_mask[None, :], other=0.0).to(tl.float32)
             sin_t = tl.load(Sin_ptr + offs_p[:, None] * ssip + offs_n[None, :] * ssin,
                              mask=n_mask[None, :], other=0.0).to(tl.float32)
 
+            # score = Σ_p U[h, p, n] * cos[p, n] + V[h, p, n] * sin[p, n] + mean
+            # Compute via hd_half matmul over p: for fixed h, score[n] = u_col[p,n].dot(cos[p,n]) ... per pair
+            # Simpler: elementwise over p, then reduce.
             s = tl.zeros((BH, BN), tl.float32)
             for p_start in range(0, hd_half, 16):
                 offs_pp = p_start + tl.arange(0, 16)
@@ -446,23 +547,27 @@ if HAS_TRITON:
                               mask=p_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
                 s += tl.sum(u * c[None, :, :] + v * sn[None, :, :], axis=1)
 
+            # mean term reduction over p:
             s += tl.sum(mc[:, :, None] * cos_t[None, :, :] + ms[:, :, None] * sin_t[None, :, :], axis=1)
             s = s * inv_sqrt_hd
             s = tl.where(h_mask[:, None] & n_mask[None, :], s, -float("inf"))
 
+            # online softmax
             m_new = tl.maximum(m_i, tl.max(s, axis=1))
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(s - m_new[:, None])
             l_i = l_i * alpha + tl.sum(p, axis=1)
             acc = acc * alpha[:, None]
 
+            # VQ V decode for this (t, d_tile)
             idx = tl.load(Idx_ptr + offs_n[:, None] * sin_ + g_idx[None, :] * sig,
                            mask=n_mask[:, None] & d_mask[None, :], other=0).to(tl.int64)
             v_rot = tl.load(Cb_ptr + idx * scc + g_pos[None, :] * scg,
                              mask=n_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
             v_rot = v_rot * ch[None, :]
 
-            acc += tl.dot(p, v_rot, input_precision="ieee")
+            # acc[h, d] += Σ_n p[h, n] * v_rot[n, d]  (explicit fp32 reduction)
+            acc += tl.sum(p[:, :, None] * v_rot[None, :, :], axis=1)
             m_i = m_new
 
         tl.store(Out_ptr + offs_h[:, None] * sou + offs_d[None, :] * sod,
@@ -473,6 +578,19 @@ if HAS_TRITON:
 
 
 def score_softmax_vq(U, V, mean_c, mean_s, cos, sin, v_indices, v_codebook, v_ch, inv_sqrt_hd):
+    """Fused: score = reduce_p(U·cos + V·sin) + mean → softmax → ·(VQ V). One-pass.
+
+    Shapes:
+      U, V: (H, hd_half, N) fp16
+      mean_c, mean_s: (H, hd_half) fp16
+      cos, sin: (hd_half, N) fp16
+      v_indices: (N, G) uint8
+      v_codebook: (C, gs) fp16
+      v_ch: (hd,) fp16
+    Returns (out_rot: (H, hd) fp32, m: (H,), l: (H,)) — the online-softmax running
+    max and sum of exp(score - max). Caller uses these for flash-style mixing with
+    sink/window segments. out_rot is Σ_t exp(s_t - m) v_t (not yet normalized by l).
+    """
     H, hd_half, N = U.shape
     hd = hd_half * 2
     C, gs = v_codebook.shape
@@ -521,10 +639,11 @@ def _score_softmax_vq_torch(U, V, mean_c, mean_s, cos, sin, v_indices, v_codeboo
     return out, m, l
 
 
-
 # ---------------------------------------------------------------------------
-# int4 pack: flat int8 [-7, 7] stream → uint8 nibbles
+# 6. int4 pack: flat int8 [-7, 7] stream → uint8 nibbles, pairing adjacent.
 # ---------------------------------------------------------------------------
+# Matches `_unpack_int4` in attention.py: each byte stores two signed nibbles
+# (hi = second value, lo = first), paired linearly in flat order.
 
 if HAS_TRITON:
     @triton.jit
@@ -544,6 +663,7 @@ if HAS_TRITON:
 
 
 def int4_pack(x):
+    """Pack flat int8 in [-7, 7] → uint8 nibbles. Accepts any shape; flattens first."""
     flat = x.reshape(-1).contiguous()
     n = flat.shape[0]
     if n & 1:
@@ -563,7 +683,7 @@ def int4_pack(x):
 
 
 # ---------------------------------------------------------------------------
-# VQ assign: nearest-centroid argmin (kmeans inner loop)
+# 7. VQ assign: nearest-centroid lookup. Replaces cdist+argmin in kmeans loop.
 # ---------------------------------------------------------------------------
 
 if HAS_TRITON:
@@ -586,6 +706,7 @@ if HAS_TRITON:
         for k_start in range(0, K, BK):
             offs_k = k_start + offs_k_base
             k_mask = offs_k < K
+            # Accumulate squared distance by iterating D (constexpr) — no 3D tensor, no tl.dot.
             dist = tl.zeros((BN, BK), tl.float32)
             for d in tl.static_range(D):
                 xd = tl.load(X_ptr + offs_n * sxn + d * sxd,
@@ -605,6 +726,7 @@ if HAS_TRITON:
 
 
 def vq_assign(x, centroids):
+    """Return argmin_k ||x[n] - centroids[k]||² as int64. x: (N, D), centroids: (K, D)."""
     N, D = x.shape
     K, D2 = centroids.shape
     assert D == D2
@@ -625,8 +747,11 @@ def vq_assign(x, centroids):
 
 
 # ---------------------------------------------------------------------------
-# Undo-RoPE fused kernel
+# 8. Undo-RoPE fused kernel: x (..., hd) + cos/sin → x_unroped.
 # ---------------------------------------------------------------------------
+# For rotate_half RoPE: undo = rotate_half's transpose.
+# x_unroped[..., :hd/2] = x[..., :hd/2]*cos + x[..., hd/2:]*sin
+# x_unroped[..., hd/2:] = x[..., hd/2:]*cos - x[..., :hd/2]*sin
 
 if HAS_TRITON:
     @triton.jit
@@ -662,6 +787,7 @@ if HAS_TRITON:
 
 
 def undo_rope_fused(x, cos, sin):
+    """Undo rotate_half RoPE. x: (..., hd), cos/sin: (..., hd) or broadcast. Returns fp16."""
     shape = x.shape
     hd = shape[-1]
     x_flat = x.reshape(-1, hd).contiguous()

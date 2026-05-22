@@ -1,5 +1,4 @@
-"""Data-oblivious per-token quantizer.
-
+"""Data-oblivious per-token quantizer for decode streaming.
 TurboQuant (Zandieh et al., ICLR 2026): random Hadamard → coordinates ~ N(0, 1/d) →
 Lloyd-Max codebook precomputed for that distribution. Optional 1-bit QJL residual
 makes inner-product estimation unbiased.
@@ -34,6 +33,7 @@ def _inv_cdf(p):
             ((((_D[0]*q+_D[1])*q+_D[2])*q+_D[3])*q+1)
 
 def lloyd_max_codebook(d, bits, n_iter=100):
+    # Lloyd-Max centroids for N(0, 1/d); closed-form E[X|X∈[a,b]] update
     n = 1 << bits
     sigma = 1.0 / math.sqrt(d)
     c = [_inv_cdf((i + 0.5) / n) * sigma for i in range(n)]
@@ -57,6 +57,7 @@ def get_codebook(d, bits, device):
     return _codebooks[k].to(device)
 
 def quantize_per_token(kv, bits, signs, qjl=False):
+    # returns (indices, qjl_sign_bits, qjl_scale); QJL fields zero when qjl=False
     d = kv.shape[-1]
     codebook = get_codebook(d, bits, kv.device)
     rotated = hadamard(kv * signs)

@@ -5,12 +5,10 @@ import numpy as np
 import torch
 from torch import Tensor
 
-
 def rotate_half(x):
     # HuggingFace convention: [-x[..., d//2:], x[..., :d//2]]
     h = x.shape[-1] // 2
     return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
-
 
 def rope_cos_sin(positions, inv_freq):
     if positions.dim() == 1:
@@ -19,13 +17,11 @@ def rope_cos_sin(positions, inv_freq):
     emb = torch.cat([freqs.transpose(1, 2)] * 2, dim=-1)
     return emb.cos(), emb.sin()
 
-
 def undo_rope(keys, positions, inv_freq):
     cos, sin = rope_cos_sin(positions, inv_freq.to(keys.device))
     while cos.dim() < keys.dim():
         cos = cos.unsqueeze(-3); sin = sin.unsqueeze(-3)
     return keys * cos - rotate_half(keys) * sin
-
 
 def reapply_rope(keys, positions, inv_freq):
     cos, sin = rope_cos_sin(positions, inv_freq.to(keys.device))
@@ -33,8 +29,8 @@ def reapply_rope(keys, positions, inv_freq):
         cos = cos.unsqueeze(-3); sin = sin.unsqueeze(-3)
     return keys * cos + rotate_half(keys) * sin
 
-
 def get_rope_inv_freq(model):
+    # try model.model.rotary_emb, then layer[0].self_attn.rotary_emb, then compute from rope_theta
     backbone = getattr(model, "model", getattr(model, "transformer", None))
     for t in (backbone, getattr(backbone, "layers", [None])[0] if backbone else None):
         if t is None: continue
@@ -49,7 +45,6 @@ def get_rope_inv_freq(model):
     if isinstance(rp, dict) and "rope_theta" in rp:
         theta = rp["rope_theta"]
     return 1.0 / (theta ** (torch.arange(0, hd, 2, dtype=torch.float32) / hd))
-
 
 def dp_bit_allocation(variances, total_budget):
     """DP over groups of 64 components, allocating 0/2/4/6/8 bits each.
@@ -88,7 +83,6 @@ def dp_bit_allocation(variances, total_budget):
             b -= (gs[g] * bits + UNIT - 1) // UNIT
     return alloc
 
-
 def _groups(alloc):
     g, i = [], 0
     while i < len(alloc):
@@ -98,8 +92,8 @@ def _groups(alloc):
         g.append((i, gs, bits)); i += gs
     return g
 
-
 def quantize_group(projected, alloc):
+    # per-column min/range header + bit-packed indices, zlib wrapped
     n = projected.shape[0]
     groups = _groups(alloc)
     headers, payload = [], []
@@ -129,7 +123,6 @@ def quantize_group(projected, alloc):
     meta = np.array([len(nz), n], dtype=np.int32).tobytes()
     g_bytes = b"".join(np.array([s, g, b], dtype=np.int16).tobytes() for s, g, b in nz)
     return zlib.compress(meta + g_bytes + b"".join(headers) + b"".join(payload), level=6)
-
 
 def dequantize_group(compressed, alloc, n, device):
     raw = zlib.decompress(compressed)
@@ -167,7 +160,6 @@ def dequantize_group(compressed, alloc, n, device):
         ci += gs
     return recon
 
-
 def pack_nbits(data, bits):
     if bits == 8:
         return data.byte().reshape(-1), data.reshape(-1).shape[0]
@@ -186,6 +178,7 @@ def pack_nbits(data, bits):
         out = torch.zeros(flat.shape[0] // 8, dtype=torch.uint8, device=data.device)
         for i in range(8): out |= flat[i::8].byte() << i
         return out, n
+    # general odd bit widths (3, 5, 6, 7)
     mask = (1 << bits) - 1
     nb = (n * bits + 7) // 8
     buf = torch.zeros(nb + 1, dtype=torch.int32, device=data.device)
@@ -197,7 +190,6 @@ def pack_nbits(data, bits):
     if ov.any():
         buf.scatter_add_(0, bi[ov] + 1, vals[ov] >> (8 - off[ov]))
     return buf[:nb].byte(), n
-
 
 def unpack_nbits(packed, bits, n):
     if bits == 8:

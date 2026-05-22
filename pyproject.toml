@@ -6,11 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "shard-kv"
 version = "0.1.0"
 description = "KV cache compression for LLM inference"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.0"]
+dependencies = [
+    "torch>=2.0",
+]
 
 [project.optional-dependencies]
 hf = ["transformers>=4.40", "accelerate"]
+dev = ["pytest", "transformers>=4.40", "accelerate"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
