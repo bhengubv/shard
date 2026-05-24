@@ -1,6 +1,6 @@
 # Shard
 
-Drop-in KV cache compression for LLM inference. **10× memory reduction** on Llama-3.1-8B-Instruct at 8K context, **11.2×** at 32K, with quality numbers indistinguishable from FP16. Full write-up: [research journal](blog/index.html).
+Drop-in KV cache compression for LLM inference. **10× memory reduction** on Llama-3.1-8B-Instruct at 8K context, **11.2×** at 32K, with quality numbers indistinguishable from FP16. Full write-up: [research journal](https://krishgarg.com/shard).
 
 Shard is a `transformers.Cache` subclass you pass to `model.generate(..., past_key_values=cache)`. It compresses the K/V cache during prefill, runs attention directly on the compressed format (no FP16 K materialization), and uses a per-token 8-bit quantizer for decode that is bit-exact lossless across 750/750 measured tokens.
 
@@ -20,7 +20,7 @@ All on Llama-3.1-8B-Instruct, single B200.
 | 8-bit streaming match vs FP16 | **750/750** |
 | Decode throughput | 0.4–0.5× FP16 |
 
-Throughput is below FP16. The implementation is a memory-capacity win, not a latency win. See the [blog](blog/index.html) for the profiler trace and what's left to fix.
+Throughput is below FP16. The implementation is a memory-capacity win, not a latency win. See the [blog](https://krishgarg.com/shard) for the profiler trace and what's left to fix.
 
 ## Install
 
@@ -59,7 +59,7 @@ out = model.generate(**ids, max_new_tokens=128, past_key_values=cache)
 | Q·K | per-pair relative-Δ RoPE on int4 coefficients | no FP16 K reconstruction |
 | weighted-sum V | inverse Hadamard pulled out past the sum | one transform at the end, not per token |
 
-Full derivation, ablations, and the failed approaches are in the [blog](blog/index.html).
+Full derivation, ablations, and the failed approaches are in the [blog](https://krishgarg.com/shard).
 
 ## Reproducing the benchmarks
 
@@ -88,8 +88,6 @@ src/shard/
 benchmarks/
   benchmark.py        # full E2E suite
   kernel_test.py      # per-kernel correctness checks
-
-blog/index.html       # research journal
 ```
 
 ## License
