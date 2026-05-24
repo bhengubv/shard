@@ -380,6 +380,8 @@ class Cache(HFCache):
         budget = max(64, int(self._per_layer_dim * 16 / self._k_target_cr))
         alloc = dp_bit_allocation(eigvals, budget)
         keep = sum(1 for b in alloc if b > 0)
+        if keep & 1:
+            keep -= 1
         if keep > 0:
             basis = basis[:, :keep].contiguous()
             alloc = alloc[:keep]
