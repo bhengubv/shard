@@ -1,6 +1,6 @@
 # Shard
 
-Drop-in KV cache compression for LLM inference. **10× memory reduction** on Llama-3.1-8B-Instruct at 8K context, **11.2×** at 32K, with quality numbers indistinguishable from FP16. Full write-up: [research journal](https://krishgarg.com/shard).
+Drop-in KV cache compression for LLM inference. **10× memory reduction** on Llama-3.1-8B-Instruct at 8K context, **11.2×** at 32K, with quality numbers indistinguishable from FP16. Full write-up: [research journal](https://krishgarg.com/shard) / [portfolio write-up](https://kirri-website.vercel.app/shard.html)
 
 Shard is a `transformers.Cache` subclass you pass to `model.generate(..., past_key_values=cache)`. It compresses the K/V cache during prefill, runs attention directly on the compressed format (no FP16 K materialization), and uses a per-token 8-bit quantizer for decode that is bit-exact lossless across 750/750 measured tokens.
 
